@@ -1,0 +1,14 @@
+.idea
+dataset/
+models/
+__pycache__/
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.wav
+*.flac
+*.mp3
+segment-algo/test_results/
+test/
