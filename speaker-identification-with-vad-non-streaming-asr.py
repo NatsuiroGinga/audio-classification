@@ -77,6 +77,7 @@ except Exception:  # pragma: no cover
 
 g_sample_rate = 16000
 
+
 def register_non_streaming_asr_model_args(parser):
     parser.add_argument(
         "--tokens",
@@ -350,7 +351,7 @@ def create_recognizer(args) -> sherpa_onnx.OfflineRecognizer:
             num_threads=args.num_threads,
             use_itn=True,
             debug=args.debug,
-            language=args.language
+            language=args.language,
         )
     else:
         raise ValueError("Please specify at least one model")
@@ -432,7 +433,52 @@ def compute_speaker_embedding(
         else:
             ans += embedding
 
-    return ans / len(filenames) # type: ignore
+    return ans / len(filenames)  # type: ignore
+
+
+def write_eval_outputs(
+    *,
+    base_out_dir: Path,
+    rows: List[Tuple[str, str, str, str, float]],
+    train_speakers: int,
+    total: int,
+    correct: int,
+    unknown_cnt: int,
+    model: str,
+    test_list_path: str,
+    threshold: float,
+) -> Path:
+    """Write predictions.csv 和 report.txt 到按时间戳创建的子目录下。
+
+    返回创建的运行目录路径。
+    """
+    # e.g. 2025-09-09_14-03-27
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = base_out_dir / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # predictions.csv
+    pred_csv = run_dir / "predictions.csv"
+    with pred_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["wav", "speaker_true", "speaker_pred", "text", "score"])
+        for r in rows:
+            w.writerow(r)
+
+    # report.txt
+    acc = (correct / total) if total else 0.0
+    report_txt = run_dir / "report.txt"
+    with report_txt.open("w", encoding="utf-8") as f:
+        f.write("Speaker Identification Offline Evaluation\n")
+        f.write(f"Train speakers: {train_speakers}\n")
+        f.write(f"Test utterances: {total}\n")
+        f.write(f"Accuracy: {acc:.4f} ({correct}/{total})\n")
+        f.write(f"Unknown predicted: {unknown_cnt}\n")
+        f.write(f"Model: {model}\n")
+        f.write(f"Test list: {test_list_path}\n")
+        f.write(f"Threshold: {threshold}\n")
+
+    return run_dir
 
 
 def main():
@@ -458,6 +504,7 @@ def main():
     def _l2(x: np.ndarray) -> np.ndarray:
         n = np.linalg.norm(x)
         return x if n == 0 else x / n
+
     enrolled_norm = {k: _l2(v) for k, v in enrolled.items()}
 
     vad_config = sherpa_onnx.VadModelConfig()
@@ -496,7 +543,9 @@ def main():
     total = 0
     correct = 0
     unknown_cnt = 0
-    rows: List[Tuple[str, str, str, str, float]] = []  # (wav, true, pred, text, top1_score)
+    rows: List[Tuple[str, str, str, str, float]] = (
+        []
+    )  # (wav, true, pred, text, top1_score)
 
     for spk_true, wavs in test_map.items():
         for wav in wavs:
@@ -536,7 +585,9 @@ def main():
             elif pred == "unknown":
                 unknown_cnt += 1
 
-            print(f"{total}: true={spk_true} pred={pred} text={text} file={Path(wav).name}")
+            print(
+                f"{total}: true={spk_true} pred={pred} text={text} file={Path(wav).name}"
+            )
             rows.append((str(wav), spk_true, pred, text, top1_score))
 
     acc = correct / total if total else 0.0
@@ -561,47 +612,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nCaught Ctrl + C. Exiting")
-
-def write_eval_outputs(
-    *,
-    base_out_dir: Path,
-    rows: List[Tuple[str, str, str, str, float]],
-    train_speakers: int,
-    total: int,
-    correct: int,
-    unknown_cnt: int,
-    model: str,
-    test_list_path: str,
-    threshold: float,
-) -> Path:
-    """Write predictions.csv 和 report.txt 到按时间戳创建的子目录下。
-
-    返回创建的运行目录路径。
-    """
-    # e.g. 2025-09-09_14-03-27
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = base_out_dir / ts
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # predictions.csv
-    pred_csv = run_dir / "predictions.csv"
-    with pred_csv.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["wav", "speaker_true", "speaker_pred", "text", "score"])
-        for r in rows:
-            w.writerow(r)
-
-    # report.txt
-    acc = (correct / total) if total else 0.0
-    report_txt = run_dir / "report.txt"
-    with report_txt.open("w", encoding="utf-8") as f:
-        f.write("Speaker Identification Offline Evaluation\n")
-        f.write(f"Train speakers: {train_speakers}\n")
-        f.write(f"Test utterances: {total}\n")
-        f.write(f"Top-1 accuracy: {acc:.4f} ({correct}/{total})\n")
-        f.write(f"Unknown predicted: {unknown_cnt}\n")
-        f.write(f"Model: {model}\n")
-        f.write(f"Test list: {test_list_path}\n")
-        f.write(f"Threshold: {threshold}\n")
-
-    return run_dir
