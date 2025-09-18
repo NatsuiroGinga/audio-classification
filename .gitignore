@@ -12,3 +12,4 @@ __pycache__/
 *.mp3
 segment-algo/test_results/
 test/
+cache/

@@ -12,7 +12,7 @@ if [ ! -d "../test" ]; then
   mkdir ../test
 fi
 
-python3 ../speaker-identification-with-vad-non-streaming-asr.py \
+python3 ./speaker-identification-with-vad-non-streaming-asr.py \
   --silero-vad-model ../models/vad/silero_vad.onnx \
   --speaker-file ../dataset/train-speaker.txt \
   --test-list ../dataset/test-speaker.txt \
