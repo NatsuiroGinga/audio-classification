@@ -218,7 +218,7 @@ class BenchmarkRunner:
         sid_time = sid_end - sid_start
         asr_time = asr_end - asr_start
         total_time = asr_end - t0
-        rtf = total_time / dur if dur > 0 else 0.0
+        rtf = asr_time / dur if dur > 0 else 0.0
         self.total += 1
         if pred == spk_true:
             self.correct += 1
