@@ -26,7 +26,7 @@ python3 ./benchmark_pipeline.py \
   --num-threads 2 \
   --out-dir ../test \
   --language zh \
-  --ref-text-list ../dataset/transcription/test_transcription \
+  --ref-text-list ../dataset/transcription/scene-2_transcription \
   --emb-cache-dir ../cache \
   --cpu-normalize \
   --load-speaker-embeds ../cache/speakers.npz \

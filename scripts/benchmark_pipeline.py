@@ -513,6 +513,8 @@ def main():
         all_test_wavs.extend(_wavs)
     print(f"Loaded test utterances: {len(all_test_wavs)}")
     refs = load_refs(args.ref_text_list, all_test_wavs)
+    print(f"refs: \n{refs}")
+    os._exit(0)
     if refs:
         print(f"Loaded references for CER: {len(refs)} lines")
     # 输出目录
