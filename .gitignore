@@ -13,3 +13,5 @@ __pycache__/
 segment-algo/test_results/
 test/
 cache/
+test*/
+todo.txt
