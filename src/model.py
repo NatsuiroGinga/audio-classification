@@ -12,6 +12,13 @@ import json
 import numpy as np
 import sherpa_onnx
 
+try:  # Optional torch usage for accepting GPU tensors
+    import torch  # type: ignore
+    _TORCH_AVAILABLE = True
+except Exception:  # pragma: no cover - torch optional
+    torch = None
+    _TORCH_AVAILABLE = False
+
 # Reuse global sample rate; fallback if not imported externally
 G_SAMPLE_RATE = 16000
 
@@ -89,6 +96,8 @@ class SpeakerASRModels:
 
     def __init__(self, args):
         self.args = args
+        self.provider = getattr(args, 'provider', 'cpu')
+        self.using_cuda = 'cuda' in self.provider.lower() or 'gpu' in self.provider.lower()
         self.asr = create_asr_model(
             paraformer=getattr(args, "paraformer", ""),
             sense_voice=getattr(args, "sense_voice", ""),
@@ -112,6 +121,34 @@ class SpeakerASRModels:
         self.manager = sherpa_onnx.SpeakerEmbeddingManager(self.extractor.dim)
         self.enrolled: Dict[str, np.ndarray] = {}
         self.enrolled_norm: Dict[str, np.ndarray] = {}
+
+    # ------------------------------------------------------------------
+    # Internal helpers for tensor/array handling
+    # ------------------------------------------------------------------
+    def _to_numpy_waveform(self, samples) -> np.ndarray:
+        """Accept np.ndarray or torch.Tensor (any device) and return float32 1-D numpy array.
+
+        If a torch CUDA tensor is given, it is moved to CPU (non_blocking if possible).
+        This is the narrowest integration point before handing audio to sherpa_onnx.
+        NOTE: sherpa_onnx Streaming/Offline APIs expect CPU numpy arrays; ONNX Runtime
+        will handle host->device transfer internally if provider is CUDA.
+        """
+        if isinstance(samples, np.ndarray):
+            if samples.dtype != np.float32:
+                samples = samples.astype(np.float32, copy=False)
+            return samples
+        if _TORCH_AVAILABLE and isinstance(samples, torch.Tensor):  # type: ignore
+            if samples.ndim > 1:
+                samples = samples.view(-1)
+            # dtype normalize
+            if samples.dtype != getattr(torch, 'float32'):
+                samples = samples.float()
+            if samples.device.type != 'cpu':
+                samples = samples.detach().to('cpu', non_blocking=True)
+            return samples.numpy()
+        # Fallback: try to coerce
+        arr = np.asarray(samples, dtype=np.float32).reshape(-1)
+        return arr
 
     # ------------------------------------------------------------------
     # Introspection / debug representation
@@ -197,7 +234,19 @@ class SpeakerASRModels:
                         except Exception:
                             emb = None
                 if emb is None:
-                    samples, sr, _ = load_audio_func(w)
+                    # Support load_audio returning either (samples, sr) or (samples, sr, ...)
+                    loaded = load_audio_func(w)
+                    if isinstance(loaded, tuple):
+                        if len(loaded) >= 2:
+                            samples, sr = loaded[0], loaded[1]
+                        elif len(loaded) == 1:
+                            # Only samples provided
+                            samples, sr = loaded[0], G_SAMPLE_RATE
+                        else:
+                            raise ValueError(f"load_audio returned empty tuple for {w}")
+                    else:
+                        # Non-tuple: assume it's the samples and use default SR
+                        samples, sr = loaded, G_SAMPLE_RATE
                     s = self.extractor.create_stream()
                     s.accept_waveform(sr, samples)
                     s.input_finished()
@@ -228,9 +277,10 @@ class SpeakerASRModels:
             except Exception:
                 pass
 
-    def identify(self, samples: np.ndarray, sr: int, threshold: float) -> Tuple[str, float]:
+    def identify(self, samples, sr: int, threshold: float) -> Tuple[str, float]:
+        samples_np = self._to_numpy_waveform(samples)
         s = self.extractor.create_stream()
-        s.accept_waveform(sr, samples)
+        s.accept_waveform(sr, samples_np)
         s.input_finished()
         assert self.extractor.is_ready(s)
         emb = np.array(self.extractor.compute(s), dtype=np.float32)
@@ -247,8 +297,9 @@ class SpeakerASRModels:
             top1_score = float("nan")
         return pred, top1_score
 
-    def asr_infer(self, samples: np.ndarray, sr: int) -> str:
+    def asr_infer(self, samples, sr: int) -> str:
+        samples_np = self._to_numpy_waveform(samples)
         st = self.asr.create_stream()
-        st.accept_waveform(sr, samples)
+        st.accept_waveform(sr, samples_np)
         self.asr.decode_stream(st)
         return st.result.text

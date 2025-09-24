@@ -1,3 +1,5 @@
+#!/bin/bash
+# Activate CUDA 11.8 environment variables
 export CUDA_HOME=/star-fj/fangjun/software/cuda-11.8.0
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH

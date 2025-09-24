@@ -4,6 +4,9 @@ pip install sherpa-onnx==1.11.1+cuda -f https://k2-fsa.github.io/sherpa/onnx/cud
 pip install soundfile
 pip install sounddevice
 pip install numpy
+pip install asteroid
+pip install pyannote.audio
+pip install huggingface_hub
 # conda 环境 importError XX/lib/libstdc++.so.6: version `GLIBCXX_3.4.30‘ not found 解决方法
 # 需要改成自己的libstdc++.so.6路径
 # ln -sf /data/workspace/llm/anaconda3/envs/audio/lib/libstdc++.so.6.0.30 /data/workspace/llm/anaconda3/envs/audio/lib/libstdc++.so.6
