@@ -15,3 +15,5 @@ test/
 cache/
 todo.txt
 test_overlap/
+test-mossformer/
+test_overlap_eval/

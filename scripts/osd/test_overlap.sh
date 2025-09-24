@@ -1,38 +1,37 @@
 #!/bin/bash
-echo 'offline_overlap_mvp testing (OSD+Separation MVP)...'
+echo '[offline_overlap_mvp] OSD + Separation + ASR (Libri2Mix 8k)'
 
-source ../activate-cuda-11.8.sh
+# Optional: source CUDA env (comment out if already set)
+if [ -f ../activate-cuda-11.8.sh ]; then
+  source ../activate-cuda-11.8.sh
+fi
 
 echo "CUDA_HOME=${CUDA_HOME}"
-
 python3 ../version.py
 
-if [ ! -d "../../test_overlap" ]; then
-  mkdir ../../test_overlap
-fi
-
-if [ ! -d "../../cache" ]; then
-  mkdir -p ../../cache
-fi
+BASE_OUT=../../test_overlap
+mkdir -p "${BASE_OUT}" ../../cache
 
 echo "HF_TOKEN=${HF_TOKEN}"
+echo 'Backends (pyannote.audio & asteroid) are REQUIRED.'
 
-echo 'OSD/Separation backends are REQUIRED (pyannote.audio, asteroid).'
+# ASR model (sense-voice example). You can switch to paraformer by replacing below two lines.
+ASR_MODEL=${ASR_MODEL:-"../../models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx"}
+TOKENS=${TOKENS:-"../../models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt"}
+
+# Limit processed mixtures: export MAX_FILES=50 (0 = all)
+MAX_FILES=${MAX_FILES:-10}
 
 python3 ./offline_overlap_mvp.py \
-  --speaker-file ../../dataset/scene-2-speaker.txt \
-  --test-list ../../dataset/scene-2-speaker.txt \
-  --model ../../models/speaker-recongition/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx \
-  --sense-voice ../../models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx \
-  --tokens ../../models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt \
+  --sense-voice "${ASR_MODEL}" \
+  --tokens "${TOKENS}" \
   --provider cuda \
   --num-threads 2 \
   --language zh \
-  --threshold 0.5 \
-  --ref-text-list ../../dataset/transcription/scene-2_transcription \
   --osd-backend pyannote \
   --sep-backend asteroid \
   --min-overlap-dur 0.4 \
-  --out-dir ../../test_overlap
+  --max-files "${MAX_FILES}" \
+  --out-dir "${BASE_OUT}"
 
-echo 'Done running offline_overlap_mvp. See ../../test_overlap for outputs.'
+echo "[offline_overlap_mvp] Done. See ${BASE_OUT}/<timestamp>/ for outputs (segments + summary)."
