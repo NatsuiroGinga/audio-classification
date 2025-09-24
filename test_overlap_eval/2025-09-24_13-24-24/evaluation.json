@@ -1,0 +1,64 @@
+{
+  "dataset": "Libri2Mix_8k",
+  "files_limit": 30,
+  "elapsed_sec": 37.319,
+  "hop_sec": 0.1,
+  "win_sec": 0.5,
+  "activity_thr": 0.03,
+  "min_overlap_dur": 0.4,
+  "gt_overlap_total_sec": 163.76,
+  "pred_overlap_total_sec": 152.19,
+  "osd": {
+    "precision": 0.9554,
+    "recall": 0.9879,
+    "f1": 0.9714,
+    "iou": 0.9444,
+    "tp_frames": 1392,
+    "fp_frames": 65,
+    "fn_frames": 17
+  },
+  "separation": {
+    "si_sdr": {
+      "count": 50,
+      "mean": -0.6708466070699853,
+      "median": -0.9331679561929912,
+      "p25": -2.1847356876512727,
+      "p75": 0.742488391625939,
+      "min": -4.485504610323749,
+      "max": 3.5337780695680725
+    },
+    "si_sdri": {
+      "count": 50,
+      "mean": -0.6897779515046981,
+      "median": -0.9545528649732458,
+      "p25": -2.2315699800321847,
+      "p75": 0.5242918174412281,
+      "min": -4.466241426666521,
+      "max": 3.498336255260682
+    }
+  },
+  "notes": "SI-SDR on predicted overlap segments; ASR metrics available when enable-asr.",
+  "asr": {
+    "overlap_mixture": {
+      "count": 48,
+      "wer_mean": 0.6456,
+      "wer_median": 0.625,
+      "cer_mean": 0.5705,
+      "cer_median": 0.5422
+    },
+    "overlap_separated": {
+      "count": 48,
+      "wer_mean": 0.5767,
+      "wer_median": 0.6077,
+      "cer_mean": 0.4093,
+      "cer_median": 0.4244
+    },
+    "clean": {
+      "count": 39,
+      "wer_mean": 0.3205,
+      "wer_median": 0.0,
+      "cer_mean": 0.2951,
+      "cer_median": 0.0
+    }
+  }
+}
