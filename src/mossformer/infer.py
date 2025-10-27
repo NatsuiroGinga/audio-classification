@@ -19,5 +19,5 @@ separation = pipeline(
 result = separation(input)
 
 for i, signal in enumerate(result["output_pcm_list"]):  # type: ignore
-    save_file = f"../../test-mossformer/output_spk{i}.wav"
+    save_file = f"../../test/mossformer/output_spk{i}.wav"
     sf.write(save_file, numpy.frombuffer(signal, dtype=numpy.int16), 8000)

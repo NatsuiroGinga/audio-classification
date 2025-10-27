@@ -19,6 +19,16 @@ import torch
 
 @dataclass
 class OverlapAnalyzer:
+    """重叠语音检测器（强制使用 pyannote.audio 的 OSD pipeline）。
+
+    参数：
+    - threshold: 置信阈值（当前实现中由 pyannote pipeline 决定，保留接口）
+    - win_sec / hop_sec: 将连续时间轴栅格化为帧（用于后处理 flags→segments）
+    - device: 推理设备（"cpu"/"cuda"）
+    - backend: 固定为 "pyannote"
+    - auth_token: HF Token（如模型受限访问）
+    """
+
     threshold: float = 0.5
     win_sec: float = 0.5
     hop_sec: float = 0.1
@@ -27,6 +37,11 @@ class OverlapAnalyzer:
     auth_token: Optional[str] = None  # Optional HuggingFace token for private models
 
     def __post_init__(self):
+        """初始化：
+        - 强制设置后端为 pyannote
+        - 从环境注入 HF Token（PYANNOTE_TOKEN / HF_TOKEN / HUGGINGFACE_TOKEN）
+        - 构建 pyannote OverlappedSpeechDetection pipeline
+        """
         self._pipeline = None
         # Force pyannote backend
         self.backend = "pyannote"
@@ -41,6 +56,7 @@ class OverlapAnalyzer:
         self._init_pyannote()
 
     def _init_pyannote(self):
+        """加载 pyannote 的 OverlappedSpeechDetection 预训练模型并移动到目标设备。"""
         try:
             from pyannote.audio.pipelines import OverlappedSpeechDetection
 
@@ -82,6 +98,7 @@ class OverlapAnalyzer:
         # output is a pyannote.core.Annotation with 'OVERLAP' label regions
         grid = np.arange(0, max(dur - self.win_sec, 0) + 1e-9, self.hop_sec)
         flags = np.zeros(len(grid), dtype=bool)
+        # 遍历 pyannote 产出的时间段，打上窗口中心位置是否落在“重叠”区间内的标记
         for segment, _, label in output.itertracks(yield_label=True):
             if str(label).upper() != "OVERLAP":
                 continue
@@ -93,6 +110,11 @@ class OverlapAnalyzer:
     def _flags_to_segments(
         self, flags: np.ndarray, dur: float
     ) -> List[Tuple[float, float, bool]]:
+        """将布尔 flags（以 hop_sec 栅格）合并为连续时间段。
+
+        - 合并相邻同标记的小段，消除 <50ms 的短间隙；
+        - 截断到 [0, dur] 范围内并过滤空段。
+        """
         segs: List[Tuple[float, float, bool]] = []
         if len(flags) == 0:
             # No overlap detected by pyannote -> all non-overlap

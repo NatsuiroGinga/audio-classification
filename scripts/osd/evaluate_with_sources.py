@@ -62,6 +62,7 @@ try:
     import torchaudio.functional as AF
 except Exception as _e:  # pragma: no cover
     torchaudio = None  # type: ignore
+    AF = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Add project root to sys.path when executed from scripts/osd
@@ -82,6 +83,14 @@ def _log(msg: str):
 
 
 def parse_args():
+    """解析命令行参数。
+
+    - OSD 参数：后端/阈值/窗口/步长
+    - 分离参数：后端/checkpoint/最小重叠时长
+    - 评估阈值：activity-thr（用于基于能量的 GT 掩码构造）
+    - 输出：目录与是否保存明细 CSV
+    - ASR（可选）：若启用，将计算 overlap vs clean 的伪参考 WER/CER
+    """
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument(
         "--max-files", type=int, default=0, help="Limit number of mixtures (0=all)"
@@ -94,6 +103,12 @@ def parse_args():
     # Separation
     p.add_argument("--sep-backend", default="asteroid")
     p.add_argument("--sep-checkpoint", default="")
+    p.add_argument(
+        "--sep-nsrc",
+        type=int,
+        default=2,
+        help="Number of separation outputs (n_src). For n_src != 2, a compatible checkpoint is required.",
+    )
     p.add_argument("--min-overlap-dur", type=float, default=0.4)
     # Activity threshold (ratio to peak frame RMS)
     p.add_argument(
@@ -103,7 +118,7 @@ def parse_args():
         help="Frame considered active if RMS > peak_rms * activity_thr",
     )
     # Output
-    p.add_argument("--out-dir", default="test_overlap_eval")
+    p.add_argument("--out-dir", default="test/overlap_eval")
     p.add_argument(
         "--save-details",
         action="store_true",
@@ -130,6 +145,7 @@ def parse_args():
 
 
 def _provider_to_torch_device(provider: str) -> str:
+    """将 onnxruntime Provider 字符串映射到 torch 的设备名。"""
     p = (provider or "").lower()
     if "cuda" in p or "gpu" in p:
         return "cuda" if torch.cuda.is_available() else "cpu"
@@ -139,6 +155,11 @@ def _provider_to_torch_device(provider: str) -> str:
 def load_audio(
     path: str, target_sr: int, device: Optional[str] = None
 ) -> Tuple[np.ndarray, int]:
+    """读取音频为单通道 float32，并重采样到 target_sr。
+
+    返回 numpy 波形（在 CPU）与采样率。若 device 提供，会在中间过程把张量移动
+    到对应设备再回拷到 CPU（对分离/OSD 的设备亲和有帮助）。
+    """
     if torchaudio is None:
         raise RuntimeError("torchaudio not available; please install it.")
     wav, sr = torchaudio.load(path)
@@ -148,6 +169,8 @@ def load_audio(
         wav = wav[0]
     wav = wav.float()
     if sr != target_sr:
+        if AF is None:
+            raise RuntimeError("torchaudio.functional.resample not available")
         wav = AF.resample(wav.unsqueeze(0), sr, target_sr).squeeze(0)
         sr = target_sr
     if device:
@@ -156,6 +179,7 @@ def load_audio(
 
 
 def frame_rms(wav: np.ndarray, sr: int, win: float, hop: float) -> np.ndarray:
+    """按滑窗计算帧 RMS，返回长度约为 floor((T-win)/hop)+1 的数组。"""
     win_s = int(win * sr)
     hop_s = int(hop * sr)
     if win_s <= 0:
@@ -175,6 +199,7 @@ def frame_rms(wav: np.ndarray, sr: int, win: float, hop: float) -> np.ndarray:
 def masks_to_segments(
     mask: np.ndarray, hop: float, win: float, total_dur: float
 ) -> List[Tuple[float, float]]:
+    """将布尔帧掩码转换为连续时间段列表 (start, end)。"""
     segs: List[Tuple[float, float]] = []
     if len(mask) == 0:
         return []
@@ -196,6 +221,11 @@ def masks_to_segments(
 def build_gt_overlap_mask(
     s1: np.ndarray, s2: np.ndarray, sr: int, win: float, hop: float, thr_ratio: float
 ) -> np.ndarray:
+    """基于能量门限构造“GT 重叠”帧掩码。
+
+    规则：rms1 > peak * thr 且 rms2 > peak * thr → 视为重叠。
+    其中 peak 为两路 RMS 的全局最大值，thr 为比例阈值。
+    """
     # Compute frame RMS
     rms1 = frame_rms(s1, sr, win, hop)
     rms2 = frame_rms(s2, sr, win, hop)
@@ -208,6 +238,7 @@ def build_gt_overlap_mask(
 def segments_to_mask(
     segments: List[Tuple[float, float, bool]], dur: float, hop: float, win: float
 ) -> np.ndarray:
+    """将 (s,e,is_overlap) 段列表映射为与 GT 帧网格一致的布尔掩码。"""
     # Create frame centers identical to GT frame indexing (start from 0, step hop)
     grid = np.arange(0, max(dur - win, 0) + 1e-9, hop)
     mask = np.zeros(len(grid), dtype=bool)
@@ -224,6 +255,7 @@ def segments_to_mask(
 
 
 def compute_osd_metrics(gt_mask: np.ndarray, pred_mask: np.ndarray) -> Dict[str, float]:
+    """根据帧掩码计算 OSD 指标：precision/recall/F1/IoU 与 TP/FP/FN 帧数。"""
     if len(gt_mask) == 0 or len(pred_mask) == 0:
         return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "iou": 0.0}
     n = min(len(gt_mask), len(pred_mask))
@@ -252,7 +284,12 @@ def compute_osd_metrics(gt_mask: np.ndarray, pred_mask: np.ndarray) -> Dict[str,
 
 
 def si_sdr(reference: np.ndarray, estimation: np.ndarray) -> float:
-    """Scale-Invariant SDR (in dB)."""
+    """Scale-Invariant SDR（dB）。
+
+    - 对输入做零均值化；
+    - 估计投影到参考上的分量和残差噪声；
+    - 计算投影能量与残差能量之比并取对数（10*log10）。
+    """
     if reference.shape != estimation.shape:
         m = min(len(reference), len(estimation))
         reference = reference[:m]
@@ -271,6 +308,7 @@ def si_sdr(reference: np.ndarray, estimation: np.ndarray) -> float:
 def perm_si_sdr(
     s1_ref: np.ndarray, s2_ref: np.ndarray, w1: np.ndarray, w2: np.ndarray
 ) -> Tuple[float, float]:
+    """对两种排列 (w1,w2) 与 (w2,w1) 分别计算平均 SI-SDR，返回最佳值与是否交换标记。"""
     # Two permutations
     sdr_12 = (si_sdr(s1_ref, w1) + si_sdr(s2_ref, w2)) / 2.0
     sdr_21 = (si_sdr(s1_ref, w2) + si_sdr(s2_ref, w1)) / 2.0
@@ -286,16 +324,133 @@ def compute_sdr_improvement(
     w1: np.ndarray,
     w2: np.ndarray,
 ) -> Tuple[float, float]:
+    """计算分离段的 SI-SDR 及相对混合的提升值（SI-SDRi）。"""
     # Baseline: mixture vs each ref (avg)
     base = (si_sdr(s1_ref, mix_chunk) + si_sdr(s2_ref, mix_chunk)) / 2.0
     best_sdr, perm_flag = perm_si_sdr(s1_ref, s2_ref, w1, w2)
     return best_sdr, best_sdr - base
 
 
+def pit_best_si_sdr(
+    refs: List[np.ndarray], preds: List[np.ndarray]
+) -> Tuple[float, List[int], bool]:
+    """对 2 条参考与 N 条预测执行 PIT，返回：
+    - best_mean_sdr: 最优平均 SI-SDR（两路参考的平均）
+    - assigned_indices: 长度为 2 的列表，[用于 ref1 的 pred 索引, 用于 ref2 的 pred 索引]
+    - swapped: 是否采用了“交换”分配（仅在选定两列上比较 12 vs 21）
+
+    要求：len(refs) == 2，len(preds) >= 2。
+    """
+    assert len(refs) == 2, "This PIT helper expects exactly 2 references."
+    if len(preds) < 2:
+        # 不足两路预测，无法进行有意义的匹配
+        return float("nan"), [], False
+    s1_ref, s2_ref = refs
+    # 预计算 sdr 矩阵：2 x P
+    sdr1 = [si_sdr(s1_ref, p) for p in preds]
+    sdr2 = [si_sdr(s2_ref, p) for p in preds]
+    best = -1e9
+    best_pair = (-1, -1)
+    best_swapped = False
+    P = len(preds)
+    for j in range(P):
+        for k in range(P):
+            if j == k:
+                continue
+            sdr_12 = 0.5 * (sdr1[j] + sdr2[k])
+            sdr_21 = 0.5 * (sdr1[k] + sdr2[j])
+            if sdr_12 >= sdr_21:
+                cur = sdr_12
+                swapped = False
+                assign = (j, k)
+            else:
+                cur = sdr_21
+                swapped = True
+                assign = (j, k)  # 仍然表示选择了 (j,k) 这两列，但采用交换匹配
+            if cur > best:
+                best = cur
+                best_pair = assign
+                best_swapped = swapped
+    return float(best), [best_pair[0], best_pair[1]], best_swapped
+
+
+def compute_sdr_improvement_pit(
+    mix_chunk: np.ndarray,
+    s1_ref: np.ndarray,
+    s2_ref: np.ndarray,
+    preds: List[np.ndarray],
+) -> Tuple[float, float, List[int], bool]:
+    """PIT 版本的 SI-SDR 与 SI-SDRi 计算。
+
+    - base：混合分别对两路参考的 SI-SDR 均值；
+    - best：对预测的多路输出进行 PIT 匹配后两路平均 SI-SDR；
+    - 返回 (best, best - base, assigned_indices, swapped)
+    """
+    base = 0.5 * (si_sdr(s1_ref, mix_chunk) + si_sdr(s2_ref, mix_chunk))
+    best, indices, swapped = pit_best_si_sdr([s1_ref, s2_ref], preds)
+    if math.isnan(best):  # 预测不足两路，跳过
+        return float("nan"), float("nan"), [], False
+    return best, best - base, indices, swapped
+
+
+def pit_best_si_sdr_k(
+    refs: List[np.ndarray], preds: List[np.ndarray]
+) -> Tuple[float, List[int]]:
+    """K 参考（K=2 或 3）与 N 预测的 PIT。
+
+    返回：
+      - best_mean_sdr: K 路平均的最优 SI-SDR
+      - assigned_indices: 分配到各参考的预测索引（长度=K）
+    """
+    K = len(refs)
+    if K == 2:
+        best, pair, _ = pit_best_si_sdr(refs, preds)
+        return best, pair
+    if K != 3:
+        raise NotImplementedError("Only K in {2,3} supported")
+    if len(preds) < 3:
+        return float("nan"), []
+    # 预计算 SDR 矩阵 (K x N)
+    sdr_mat = [[si_sdr(refs[i], p) for p in preds] for i in range(3)]
+    import itertools
+
+    N = len(preds)
+    best = -1e9
+    best_idx: List[int] = []
+    for cols in itertools.combinations(range(N), 3):
+        for perm in itertools.permutations(cols, 3):
+            cur = (
+                sdr_mat[0][perm[0]] + sdr_mat[1][perm[1]] + sdr_mat[2][perm[2]]
+            ) / 3.0
+            if cur > best:
+                best = cur
+                best_idx = list(perm)
+    return float(best), best_idx
+
+
+def compute_sdr_improvement_pit_k(
+    mix_chunk: np.ndarray, refs: List[np.ndarray], preds: List[np.ndarray]
+) -> Tuple[float, float, List[int]]:
+    """K 参考（K=2 或 3）的 PIT 版 SI-SDR 与 SI-SDRi。"""
+    if len(refs) not in (2, 3):
+        raise NotImplementedError("Only K=2 or 3 refs are supported")
+    base = float(np.mean([si_sdr(r, mix_chunk) for r in refs]))
+    best, idx = pit_best_si_sdr_k(refs, preds)
+    if math.isnan(best):
+        return float("nan"), float("nan"), []
+    return best, best - base, idx
+
+
 #########################
 # CPU monitor utilities #
 #########################
 class CPUMonitor:
+    """简单的进程 CPU 监控器（基于 psutil）。
+
+    - 每隔 interval 采一次进程 cpu_percent（聚合所有逻辑核）
+    - 结束时报告归一化到 0–100% 的均值/峰值（同时保留原始 raw 值）
+    """
+
     def __init__(self, interval: float = 0.5):
         self.interval = max(0.1, interval)
         self._stop = threading.Event()
@@ -311,6 +466,7 @@ class CPUMonitor:
                 self.started = False
 
     def start(self):
+        """启动后台采样线程。"""
         if not self.started:
             return
 
@@ -325,6 +481,7 @@ class CPUMonitor:
         self._thread.start()
 
     def stop(self) -> Dict[str, Any]:
+        """停止采样并返回聚合统计。"""
         if not self.started:
             return {"enabled": False, "reason": "psutil_unavailable"}
         self._stop.set()
@@ -360,15 +517,18 @@ class CPUMonitor:
 
 
 def _normalize_text(t: str) -> str:
+    """文本规整：去首尾空白。"""
     return t.strip()
 
 
 def _split_words(t: str) -> List[str]:
+    """按空白切分为词列表（用于 WER 计算）。"""
     t = _normalize_text(t)
     return t.split() if t else []
 
 
 def _cer(ref: str, hyp: str) -> float:
+    """字符错误率（编辑距离 / 参考长度）。"""
     ref_chars = list(_normalize_text(ref))
     hyp_chars = list(_normalize_text(hyp))
     if not ref_chars:
@@ -391,6 +551,7 @@ def _cer(ref: str, hyp: str) -> float:
 
 
 def _wer(ref: str, hyp: str) -> float:
+    """词错误率（编辑距离 / 参考词数）。"""
     r = _split_words(ref)
     h = _split_words(hyp)
     if not r:
@@ -413,6 +574,7 @@ def _wer(ref: str, hyp: str) -> float:
 
 
 def _build_asr(args):
+    """根据 CLI 参数构建 sherpa-onnx ASR 模型（可选）。"""
     return create_asr_model(
         paraformer=args.paraformer,
         sense_voice=args.sense_voice,
@@ -430,6 +592,7 @@ def _build_asr(args):
 
 
 def _asr_infer(model, sr: int, wav: np.ndarray) -> str:
+    """对一段波形进行 ASR 推理并返回规整文本。"""
     st = model.create_stream()
     st.accept_waveform(sr, wav)
     model.decode_stream(st)
@@ -437,6 +600,7 @@ def _asr_infer(model, sr: int, wav: np.ndarray) -> str:
 
 
 def main():
+    """入口：对 Libri2Mix 8k 进行 OSD + 分离评估（可选 ASR 对比），输出 evaluation.json。"""
     args = parse_args()
     # Prepare dirs
     out_base = Path(args.out_dir)
@@ -448,7 +612,7 @@ def main():
     device = _provider_to_torch_device(args.provider)
     _log(f"Device={device}")
 
-    # Initialize models
+    # Initialize models（OSD/分离必需；ASR 可选）
     osd = OverlapAnalyzer(
         threshold=args.osd_thr,
         win_sec=args.osd_win,
@@ -459,6 +623,7 @@ def main():
     sep = Separator(
         backend=args.sep_backend,
         checkpoint=(args.sep_checkpoint or None),
+        n_src=max(1, int(args.sep_nsrc)),
         device=device,
     )
     asr_model = _build_asr(args) if args.enable_asr else None
@@ -497,7 +662,18 @@ def main():
         )
         writer = csv.writer(details_csv)
         writer.writerow(
-            ["wav", "seg_start", "seg_end", "dur", "si_sdr", "si_sdri", "perm_swapped"]
+            [
+                "wav",
+                "seg_start",
+                "seg_end",
+                "dur",
+                "si_sdr",
+                "si_sdri",
+                "perm_swapped",
+                "selected_pred_indices",
+                "sep_nsrc",
+                "k_refs",
+            ]
         )
 
     t0 = time.time()
@@ -520,6 +696,11 @@ def main():
             mix_p = str(getattr(item, "mix_wav:FILE", ""))
             s1_p = str(getattr(item, "s1_wav:FILE", ""))
             s2_p = str(getattr(item, "s2_wav:FILE", ""))
+        # optional third source
+        try:
+            s3_p = str(item.get("s3_wav:FILE"))  # type: ignore[call-arg]
+        except Exception:
+            s3_p = str(getattr(item, "s3_wav:FILE", ""))
         if not (
             mix_p
             and s1_p
@@ -532,10 +713,18 @@ def main():
         mix, sr = load_audio(mix_p, target_sr=G_SAMPLE_RATE)
         s1, _ = load_audio(s1_p, target_sr=G_SAMPLE_RATE)
         s2, _ = load_audio(s2_p, target_sr=G_SAMPLE_RATE)
-        m = min(len(mix), len(s1), len(s2))
+        have_s3 = bool(s3_p and os.path.isfile(s3_p))
+        if have_s3:
+            s3, _ = load_audio(s3_p, target_sr=G_SAMPLE_RATE)
+            m = min(len(mix), len(s1), len(s2), len(s3))
+        else:
+            s3 = None
+            m = min(len(mix), len(s1), len(s2))
         mix = mix[:m]
         s1 = s1[:m]
         s2 = s2[:m]
+        if have_s3 and s3 is not None:
+            s3 = s3[:m]
         dur = m / sr
         audio_total_sec += dur  # 统计总音频时长
 
@@ -549,9 +738,27 @@ def main():
         pred_mask = segments_to_mask(pred_segments, dur, args.osd_hop, args.osd_win)
         pred_overlap_total_sec += sum(e - s for s, e, f in pred_segments if f)
 
-        gt_mask = build_gt_overlap_mask(
-            s1, s2, sr, args.osd_win, args.osd_hop, args.activity_thr
-        )
+        if have_s3 and s3 is not None:
+            # >=2 active among three sources
+            rms1 = frame_rms(s1, sr, args.osd_win, args.osd_hop)
+            rms2 = frame_rms(s2, sr, args.osd_win, args.osd_hop)
+            rms3 = frame_rms(s3, sr, args.osd_win, args.osd_hop)
+            peak = max(
+                rms1.max(initial=0.0),
+                rms2.max(initial=0.0),
+                rms3.max(initial=0.0),
+                1e-9,
+            )
+            active1 = rms1 > peak * args.activity_thr
+            active2 = rms2 > peak * args.activity_thr
+            active3 = rms3 > peak * args.activity_thr
+            gt_mask = (
+                active1.astype(int) + active2.astype(int) + active3.astype(int)
+            ) >= 2
+        else:
+            gt_mask = build_gt_overlap_mask(
+                s1, s2, sr, args.osd_win, args.osd_hop, args.activity_thr
+            )
         gt_segments = masks_to_segments(gt_mask, args.osd_hop, args.osd_win, dur)
         gt_overlap_total_sec += sum(e - s for s, e in gt_segments)
 
@@ -565,7 +772,7 @@ def main():
         osd_fp += fp
         osd_fn += fn
 
-        # Separation SI-SDR
+        # Separation SI-SDR（支持 K=2/3 参考，n_src>=K）
         for s, e, is_olap in pred_segments:
             if not is_olap:
                 continue
@@ -578,15 +785,30 @@ def main():
             mix_chunk = mix[s_i:e_i]
             s1_chunk = s1[s_i:e_i]
             s2_chunk = s2[s_i:e_i]
+            refs = [s1_chunk, s2_chunk]
+            if have_s3 and s3 is not None:
+                refs = [s1_chunk, s2_chunk, s3[s_i:e_i]]
             t_sep_start = time.time()
-            w1, w2 = sep.separate(mix_chunk, sr)
+            pred_wavs = sep.separate(mix_chunk, sr)
             sep_time_sec += time.time() - t_sep_start
             overlap_predicted_sec_for_sep += e - s
-            seg_sdr, seg_sdri = compute_sdr_improvement(
-                mix_chunk, s1_chunk, s2_chunk, w1, w2
-            )
-            sdr_list.append(seg_sdr)
-            sdri_list.append(seg_sdri)
+            K = len(refs)
+            if int(args.sep_nsrc) < K:
+                # 参考两路，需要至少两路输出；此段跳过
+                continue
+            if K == 2:
+                seg_sdr, seg_sdri, assign_idx, swapped = compute_sdr_improvement_pit(
+                    mix_chunk, s1_chunk, s2_chunk, pred_wavs
+                )
+            else:
+                seg_sdr, seg_sdri, assign_idx = compute_sdr_improvement_pit_k(
+                    mix_chunk, refs, pred_wavs
+                )
+                swapped = False
+            if not math.isnan(seg_sdr):
+                sdr_list.append(seg_sdr)
+            if not math.isnan(seg_sdri):
+                sdri_list.append(seg_sdri)
             if writer:
                 writer.writerow(
                     [
@@ -594,31 +816,50 @@ def main():
                         f"{s:.3f}",
                         f"{e:.3f}",
                         f"{(e - s):.3f}",
-                        f"{seg_sdr:.3f}",
-                        f"{seg_sdri:.3f}",
-                        1 if seg_sdri < 0 else 0,
+                        f"{(0.0 if math.isnan(seg_sdr) else seg_sdr):.3f}",
+                        f"{(0.0 if math.isnan(seg_sdri) else seg_sdri):.3f}",
+                        1 if swapped else 0,
+                        ";".join(str(i) for i in assign_idx) if assign_idx else "",
+                        int(args.sep_nsrc),
+                        K,
                     ]
                 )
 
         # ASR 评估
         if args.enable_asr and asr_model is not None:
-            rms1 = frame_rms(s1, sr, args.osd_win, args.osd_hop)
-            rms2 = frame_rms(s2, sr, args.osd_win, args.osd_hop)
-            peak = max(rms1.max(initial=0.0), rms2.max(initial=0.0), 1e-9)
-            active1 = rms1 > peak * args.activity_thr
-            active2 = rms2 > peak * args.activity_thr
-            gt_overlap_mask = active1 & active2
-            clean1_mask = active1 & ~active2
-            clean2_mask = active2 & ~active1
+            # Recompute active masks (2 or 3 refs)
+            if have_s3 and s3 is not None:
+                rms1 = frame_rms(s1, sr, args.osd_win, args.osd_hop)
+                rms2 = frame_rms(s2, sr, args.osd_win, args.osd_hop)
+                rms3 = frame_rms(s3, sr, args.osd_win, args.osd_hop)
+                peak = max(
+                    rms1.max(initial=0.0),
+                    rms2.max(initial=0.0),
+                    rms3.max(initial=0.0),
+                    1e-9,
+                )
+                a1 = rms1 > peak * args.activity_thr
+                a2 = rms2 > peak * args.activity_thr
+                a3 = rms3 > peak * args.activity_thr
+                gt_overlap_mask = (
+                    a1.astype(int) + a2.astype(int) + a3.astype(int)
+                ) >= 2
+                clean_masks = [a1 & ~a2 & ~a3, a2 & ~a1 & ~a3, a3 & ~a1 & ~a2]
+            else:
+                rms1 = frame_rms(s1, sr, args.osd_win, args.osd_hop)
+                rms2 = frame_rms(s2, sr, args.osd_win, args.osd_hop)
+                peak = max(rms1.max(initial=0.0), rms2.max(initial=0.0), 1e-9)
+                a1 = rms1 > peak * args.activity_thr
+                a2 = rms2 > peak * args.activity_thr
+                gt_overlap_mask = a1 & a2
+                clean_masks = [a1 & ~a2, a2 & ~a1]
             overlap_segments = masks_to_segments(
                 gt_overlap_mask, args.osd_hop, args.osd_win, dur
             )
-            clean1_segments = masks_to_segments(
-                clean1_mask, args.osd_hop, args.osd_win, dur
-            )
-            clean2_segments = masks_to_segments(
-                clean2_mask, args.osd_hop, args.osd_win, dur
-            )
+            clean_segments_list = [
+                masks_to_segments(cm, args.osd_hop, args.osd_win, dur)
+                for cm in clean_masks
+            ]
 
             for s_t, e_t in overlap_segments:
                 if (e_t - s_t) < args.min_overlap_dur:
@@ -634,20 +875,25 @@ def main():
                 ref1_txt = _asr_infer(asr_model, sr, s1_chunk)
                 ref2_txt = _asr_infer(asr_model, sr, s2_chunk)
                 mix_hyp = _asr_infer(asr_model, sr, mix_chunk)
-                w1, w2 = sep.separate(mix_chunk, sr)
-                sep_time_sec += (
-                    0.0  # 已在上面对分离计时，此处不重复；如需单独计时可再包
-                )
-                hyp1 = _asr_infer(asr_model, sr, w1)
-                hyp2 = _asr_infer(asr_model, sr, w2)
-                asr_time_sec += time.time() - t_asr_start
-                cost_12 = _cer(ref1_txt, hyp1) + _cer(ref2_txt, hyp2)
-                cost_21 = _cer(ref1_txt, hyp2) + _cer(ref2_txt, hyp1)
-                hyp_pair = hyp2 + " " + hyp1 if cost_21 < cost_12 else hyp1 + " " + hyp2
-                overlap_mix_refs.append(ref1_txt + " " + ref2_txt)
-                overlap_mix_hyps.append(mix_hyp)
-                overlap_sep_refs.append(ref1_txt + " " + ref2_txt)
-                overlap_sep_hyps.append(hyp_pair)
+                if int(args.sep_nsrc) == 2 and not have_s3:
+                    pw = sep.separate(mix_chunk, sr)
+                    hyp1 = _asr_infer(asr_model, sr, pw[0])
+                    hyp2 = _asr_infer(asr_model, sr, pw[1])
+                    asr_time_sec += time.time() - t_asr_start
+                    cost_12 = _cer(ref1_txt, hyp1) + _cer(ref2_txt, hyp2)
+                    cost_21 = _cer(ref1_txt, hyp2) + _cer(ref2_txt, hyp1)
+                    hyp_pair = (
+                        hyp2 + " " + hyp1 if cost_21 < cost_12 else hyp1 + " " + hyp2
+                    )
+                    overlap_mix_refs.append(ref1_txt + " " + ref2_txt)
+                    overlap_mix_hyps.append(mix_hyp)
+                    overlap_sep_refs.append(ref1_txt + " " + ref2_txt)
+                    overlap_sep_hyps.append(hyp_pair)
+                else:
+                    # n_src != 2 时，重叠段的“分离后 ASR”对齐不明确，出于可读性暂不统计
+                    asr_time_sec += time.time() - t_asr_start
+                    overlap_mix_refs.append(ref1_txt + " " + ref2_txt)
+                    overlap_mix_hyps.append(mix_hyp)
 
             def _eval_clean(seg_list, src_wav):
                 nonlocal asr_time_sec
@@ -667,8 +913,9 @@ def main():
                     clean_refs.append(ref_txt)
                     clean_hyps.append(mix_txt)
 
-            _eval_clean(clean1_segments, s1)
-            _eval_clean(clean2_segments, s2)
+            for i, segs in enumerate(clean_segments_list):
+                src = s1 if i == 0 else (s2 if i == 1 else (s3 if have_s3 else s2))
+                _eval_clean(segs, src)
 
         if (idx + 1) % 20 == 0:
             _log(f"Processed {idx+1}/{limit}")
@@ -717,6 +964,7 @@ def main():
         "elapsed_sec": round(elapsed, 3),
         "hop_sec": args.osd_hop,
         "win_sec": args.osd_win,
+        "sep_nsrc": int(args.sep_nsrc),
         "activity_thr": args.activity_thr,
         "min_overlap_dur": args.min_overlap_dur,
         "gt_overlap_total_sec": round(gt_overlap_total_sec, 3),
@@ -768,11 +1016,21 @@ def main():
                 "cer_median": round(float(np.median(cers)), 4),
             }
 
-        eval_json["asr"] = {
+        asr_dict: Dict[str, Any] = {
             "overlap_mixture": _aggregate(overlap_mix_refs, overlap_mix_hyps),
-            "overlap_separated": _aggregate(overlap_sep_refs, overlap_sep_hyps),
             "clean": _aggregate(clean_refs, clean_hyps),
         }
+        if int(args.sep_nsrc) == 2:
+            asr_dict["overlap_separated"] = _aggregate(
+                overlap_sep_refs, overlap_sep_hyps
+            )
+        else:
+            asr_dict["overlap_separated"] = {
+                "count": 0,
+                "skipped": True,
+                "reason": "sep_nsrc != 2; pairing references with >2 predictions is ambiguous for simple text concat.",
+            }
+        eval_json["asr"] = asr_dict
 
     with (out_dir / "evaluation.json").open("w", encoding="utf-8") as f:
         json.dump(eval_json, f, ensure_ascii=False, indent=2)
