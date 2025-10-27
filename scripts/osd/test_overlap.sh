@@ -9,7 +9,7 @@ fi
 echo "CUDA_HOME=${CUDA_HOME}"
 python3 ../version.py
 
-BASE_OUT=../../test_overlap
+BASE_OUT=../../test/overlap
 mkdir -p "${BASE_OUT}" ../../cache
 
 echo "HF_TOKEN=${HF_TOKEN}"

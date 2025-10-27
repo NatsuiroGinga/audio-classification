@@ -23,7 +23,7 @@ OSD_HOP=${OSD_HOP:-0.1}
 PROVIDER=${PROVIDER:-cpu}
 SEP_CHECKPOINT=${SEP_CHECKPOINT:-}
 SAVE_DETAILS=${SAVE_DETAILS:-1}   # 1=enable overlap_details.csv
-OUT_BASE=${OUT_BASE:-../../test_overlap_eval}
+OUT_BASE=${OUT_BASE:-../../test/overlap_eval}
 
 # Optional ASR evaluation (pseudo-reference) parameters
 ENABLE_ASR=${ENABLE_ASR:-1}          # 1 to enable --enable-asr

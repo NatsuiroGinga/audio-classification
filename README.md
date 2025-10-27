@@ -97,6 +97,54 @@ summary.json 主要字段：
 - CLI 中 `--speaker-file`, `--test-list`, `--ref-text-list` 已删除。
 - CLI 中 `--threshold` 仅为兼容占位，可忽略。
 
+### 评估（带源语音，对 OSD/分离/可选 ASR 进行量化）
+
+我们提供评估脚本用于在 Libri2Mix 8k 上对“预测的重叠片段”做质量评估：
+
+```bash
+cd scripts/osd
+# 快速启动（推荐用包装脚本，会根据环境拼好参数）
+./eval_overlap_sources.sh
+
+# 或直接运行 Python（可自行传参）
+python3 evaluate_with_sources.py \
+  --max-files 30 \
+  --osd-backend pyannote --sep-backend asteroid \
+  --activity-thr 0.03 --min-overlap-dur 0.4
+```
+
+可选开启 ASR 对比（仅用于“重叠 vs 分离后 vs clean”伪参考对比）：
+
+```bash
+export ENABLE_ASR=1   # 在 eval_overlap_sources.sh 中生效
+./eval_overlap_sources.sh
+```
+
+输出目录：`test_overlap_eval/<YYYY-MM-DD_HH-MM-SS>/`
+
+- `evaluation.json`：聚合指标（见下）
+- `overlap_details.csv`：每个“预测重叠片段”的 SI-SDR 明细（及可选 ASR 明细）
+
+evaluation.json 主要字段说明：
+
+- `osd`: OSD 精度/召回/F1/IoU（基于能量门限构造的 GT 掩码）
+- `separation`: 在“预测重叠片段”上计算的 SI-SDR 与 SI-SDRi（Permutation Invariant）
+- `asr`（可选 ENABLE_ASR）:
+  - `overlap_mixture` / `overlap_separated` / `clean` 的 WER/CER 分布聚合
+- `timing`: 分阶段耗时与 RTF
+  - `rtf_total = time_wall_sec / audio_total_sec`
+  - `rtf_osd`、`rtf_sep_*`、`rtf_asr` 为各阶段相对实时比
+- `cpu`: 进程 CPU 使用率（已“归一化”到 0–100%）
+  - `cpu_avg_percent` / `cpu_peak_percent`: 归一化后百分比（约等于原始值除以逻辑核数，最高截断 100）
+  - `cpu_avg_percent_raw` / `cpu_peak_percent_raw`: 原始 psutil 聚合值（可能大于 100%）
+  - `cpu_logical_cores`: 逻辑核数，`normalized: true` 表示已做归一化
+- `gpu`（若已启用 GPU 监控）: 利用率/显存统计（脚本内使用 pynvml/torch 采集）
+
+提示：
+
+- 评估脚本仅在“预测为重叠”的片段上计算分离质量（SI-SDR），未预测到的 GT 重叠不计入。
+- 由于域不匹配，默认的 Conv-TasNet 在中文语音上可能出现 SI-SDRi 为负的情况；可更换更合适的分离模型或做全局分离策略优化。
+
 ### Hugging Face Token（仅在需要时）
 
 - 若 pyannote 的 `pyannote/overlapped-speech-detection` 需要认证，请在环境中设置以下任一变量（按优先级读取）：
@@ -122,6 +170,50 @@ python3 ./offline_overlap_mvp.py \
   ...其它参数... \
   --sep-checkpoint /path/to/conv_tasnet_checkpoint.pt
 ```
+
+## 所使用的模型与文档/下载地址
+
+重叠语音检测（OSD）
+
+- 模型：pyannote/overlapped-speech-detection
+- 代码/文档：<https://github.com/pyannote/pyannote-audio>
+- 模型页（HF）：<https://huggingface.co/pyannote/overlapped-speech-detection>
+- 说明：多数 pyannote 模型需要 HF Token 授权
+
+语音分离（2 说话人）
+
+- 框架：Asteroid（Conv-TasNet）<https://github.com/asteroid-team/asteroid>
+- 默认权重（自动下载）：mpariente/ConvTasNet_WHAM_sepclean
+  - 模型页（HF）：<https://huggingface.co/mpariente/ConvTasNet_WHAM_sepclean>
+
+ASR（可选，多分支）
+
+- SenseVoice（Sherpa-ONNX 多语）
+  - Sherpa-ONNX 文档：<https://k2-fsa.github.io/sherpa/>
+  - 发布页集合（含多模型）：<https://github.com/k2-fsa/sherpa-onnx/releases>
+- Paraformer（FunASR 系列）
+  - FunASR 项目：<https://github.com/alibaba-damo-academy/FunASR>
+  - ModelScope 示例（中文 Paraformer）：<https://modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch/summary>
+- RNN-T（encoder/decoder/joiner）
+  - 同 Sherpa-ONNX 发布页（手动指定 --encoder/--decoder/--joiner 时使用）
+
+数据集（评估用）
+
+- Libri2Mix/LibriMix：<https://github.com/JorisCos/LibriMix>
+- LibriSpeech（源语料）：<https://www.openslr.org/12>
+
+相关工具/库
+
+- huggingface_hub（权重下载）：<https://github.com/huggingface/huggingface_hub>
+- torchaudio（音频 I/O/重采样）：<https://pytorch.org/audio/stable/>
+- psutil（CPU 监控）：<https://github.com/giampaolo/psutil>
+- pynvml（GPU 监控）：<https://pypi.org/project/pynvml/>
+
+许可与合规：
+
+- pyannote 多为研究许可，请确认商业使用限制。
+- FunASR/Paraformer 权重各自附带 LICENSE，请在部署前复核。
+- WHAM/LibriMix/LibriSpeech 遵循各自数据协议，请按条款使用。
 
 ## 目录结构
 
