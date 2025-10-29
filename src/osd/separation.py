@@ -38,15 +38,23 @@ class Separator:
         try:
             import torch  # type: ignore
             from asteroid.models import ConvTasNet  # type: ignore
+            from asteroid.models import BaseModel
 
-            # 根据 n_src 构建模型（注意需与权重训练时一致）
-            self._model = ConvTasNet(n_src=self.n_src)
-            ckpt_path = self._ensure_checkpoint()
-            if ckpt_path:
-                state = torch.load(ckpt_path, map_location=self.device)
-                # Support both plain state_dict and wrapped dicts
-                sd = state.get("state_dict", state)
-                self._model.load_state_dict(sd, strict=False)
+            if self.n_src == 3:
+                self._model = BaseModel.from_pretrained(
+                    "JorisCos/ConvTasNet_Libri3Mix_sepclean_16k"
+                )
+                print("Loaded pretrained ConvTasNet for 3 sources from Hugging Face.")
+            else:
+                # 根据 n_src 构建模型（注意需与权重训练时一致）
+                self._model = ConvTasNet(n_src=self.n_src)
+                ckpt_path = self._ensure_checkpoint()
+                if ckpt_path:
+                    state = torch.load(ckpt_path, map_location=self.device)
+                    # Support both plain state_dict and wrapped dicts
+                    sd = state.get("state_dict", state)
+                    self._model.load_state_dict(sd, strict=False)
+                    print(f"Loaded ConvTasNet weights from {ckpt_path}.")
             self._model.to(self.device)
             self._model.eval()
         except Exception as e:

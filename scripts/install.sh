@@ -1,91 +1,73 @@
 #!/bin/bash
-# Install necessary dependencies
-pip install sherpa-onnx==1.11.1+cuda -f https://k2-fsa.github.io/sherpa/onnx/cuda.html
-pip install soundfile
-pip install sounddevice
-pip install numpy
-pip install asteroid
-pip install pyannote.audio
-pip install huggingface_hub
-# conda 环境 importError XX/lib/libstdc++.so.6: version `GLIBCXX_3.4.30‘ not found 解决方法
-# 需要改成自己的libstdc++.so.6路径
-# ln -sf /data/workspace/llm/anaconda3/envs/audio/lib/libstdc++.so.6.0.30 /data/workspace/llm/anaconda3/envs/audio/lib/libstdc++.so.6
+set -euo pipefail
 
-# Install CUDA 11.8
-mkdir ../cuda
-cd ../cuda || exit
-wget https://developer.download.nvidia.com/compute/cuda/11.8.0/local_installers/cuda_11.8.0_520.61.05_linux.run
+echo '[install] Install Python dependencies and download default models'
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
 
-chmod +x cuda_11.8.0_520.61.05_linux.run
+cd "${SCRIPT_DIR}" || exit 1
 
-./cuda_11.8.0_520.61.05_linux.run \
-  --silent \
-  --toolkit \
-  --installpath=/star-fj/fangjun/software/cuda-11.8.0 \
-  --no-opengl-libs \
-  --no-drm \
-  --no-man-page
+# -----------------------------------------------------------------------------
+# 1) Python dependencies
+# -----------------------------------------------------------------------------
+# By default we install CUDA-enabled wheels pinned in requirements.txt.
+# If you want CPU-only, set CPU=1 before running this script.
 
-# Install cuDNN for CUDA 11.8
-wget https://huggingface.co/csukuangfj/cudnn/resolve/main/cudnn-linux-x86_64-8.9.1.23_cuda11-archive.tar.xz
+CPU_MODE=${CPU:-0}
 
-tar xvf cudnn-linux-x86_64-8.9.1.23_cuda11-archive.tar.xz --strip-components=1 -C /star-fj/fangjun/software/cuda-11.8.0
+python3 -m pip install --upgrade pip
 
-# Set environment variables for CUDA 11.8
-echo 'export CUDA_HOME=/star-fj/fangjun/software/cuda-11.8.0
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib:$LD_LIBRARY_PATH
+if [[ "${CPU_MODE}" == "1" ]]; then
+  echo '[install] CPU mode: installing CPU wheels'
+  # Minimal CPU set (override GPU-pinned ones). Adjust versions if needed.
+  python3 -m pip install --no-cache-dir \
+    torch==2.5.0 \
+    torchaudio==2.5.0 \
+    onnxruntime==1.20.0 \
+    numpy==2.3.4 \
+    soundfile sounddevice tqdm \
+    huggingface_hub==0.34.4 \
+    psutil==5.9.0 \
+    matplotlib==3.10.7 \
+    asteroid==0.7.0 \
+    pyannote_audio==3.4.0 \
+    pyannote.core==5.0.0 pyannote.database==5.1.3 pyannote.metrics==3.2.1 pyannote.pipeline==3.0.1
+  # sherpa-onnx CPU
+  python3 -m pip install --no-cache-dir sherpa-onnx==1.11.1 -f https://k2-fsa.github.io/sherpa/onnx/cpu.html
+else
+  echo '[install] CUDA mode: installing pinned GPU wheels from requirements.txt'
+  # sherpa-onnx CUDA wheels index is needed for the "+cuda" build
+  python3 -m pip install --no-cache-dir -r "${ROOT_DIR}/requirements.txt" -f https://k2-fsa.github.io/sherpa/onnx/cuda.html
+fi
 
-export CUDA_TOOLKIT_ROOT_DIR=$CUDA_HOME
-export CUDA_TOOLKIT_ROOT=$CUDA_HOME
-export CUDA_BIN_PATH=$CUDA_HOME
-export CUDA_PATH=$CUDA_HOME
-export CUDA_INC_PATH=$CUDA_HOME/targets/x86_64-linux
-export CFLAGS=-I$CUDA_HOME/targets/x86_64-linux/include:$CFLAGS' > ./activate-cuda-11.8.sh
+echo '[install] Python dependencies done.'
 
-# Download models
-mkdir -p ../models/vad
-mkdir -p ../models/speaker-recongition
-mkdir -p ../models/asr
+# -----------------------------------------------------------------------------
+# 2) Download default models (speaker embedding + ASR)
+# -----------------------------------------------------------------------------
+mkdir -p "${ROOT_DIR}/models/asr" "${ROOT_DIR}/models/speaker-recognition"
 
-echo 'Downloading models...'
+echo '[install] Downloading 3dspeaker (speaker embedding ONNX) ...'
+wget -q --show-progress -O "${ROOT_DIR}/models/speaker-recognition/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx" \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
 
-echo 'Downloading silero_vad.onnx...'
-wget -P ../models/vad https://github.com/snakers4/silero-vad/raw/refs/tags/v5.0/files/silero_vad.onnx
+echo '[install] Downloading sherpa-onnx SenseVoice (ASR) ...'
+ASR_TARBALL="${ROOT_DIR}/models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2"
+wget -q --show-progress -O "${ASR_TARBALL}" \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
+tar xvf "${ASR_TARBALL}" -C "${ROOT_DIR}/models/asr"
+rm -f "${ASR_TARBALL}"
 
-echo 'Downloading 3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx...'
-wget -P ../models/speaker-recongition speaker-recongition/3dspeaker_speech_eres2net_base https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+echo '[install] Models ready.'
 
-echo 'Downloading sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17...'
-wget -P ../models/asr wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
-tar xvf sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
-rm sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
+# -----------------------------------------------------------------------------
+# 3) Notes for datasets
+# -----------------------------------------------------------------------------
+echo '[install] Dataset setup:'
+echo '  - 三路分离脚本依赖 LibriMix/Libri3Mix，请自行准备并设置环境变量 LIBRIMIX_ROOT 指向其上级目录。'
+echo '  - 参考：https://github.com/JorisCos/LibriMix'
+echo '  - 示例：export LIBRIMIX_ROOT=/abs/path/to/LibriMix'
 
-echo 'All done!'
-echo 'Show files in models directory:'
-ls -R ../models
-
-# Download dataset
-mkdir -p ../dataset
-echo 'Downloading dataset...'
-wget -P ../dataset https://speech-lab-share-data.oss-cn-shanghai.aliyuncs.com/3D-Speaker/test.tar.gz
-tar xvf ../dataset/test.tar.gz -C ../dataset
-rm ../dataset/test.tar.gz
-
-# Split speakers into train and test sets
-echo 'Splitting speakers into train and test sets...'
-
-bash ./generate-speaker-text.sh
-
-python ./split_speakers.py \
-  --input ../dataset/speaker.txt \
-  --train-out ../dataset/train-speaker.txt \
-  --test-out ../dataset/test-speaker.txt \
-  --train-ratio 0.8 \
-  --seed 42 \
-  --mode utterance
-
-echo 'All done!'
-echo 'Show files in dataset directory:'
-ls -R ../dataset
+echo '[install] Done.'
+echo 'Models tree:'
+ls -R "${ROOT_DIR}/models"

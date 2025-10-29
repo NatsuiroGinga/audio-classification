@@ -18,11 +18,18 @@ cd scripts
 bash install.sh
 ```
 
-- 脚本会安装：
-  - sherpa-onnx（ASR 与说话人）、soundfile/sounddevice/numpy
-  - asteroid（分离，必需）
-  - pyannote.audio（OSD，必需）
-  - huggingface_hub（自动下载分离 checkpoint）
+- 脚本会：
+  - 安装 Python 依赖（默认 GPU/CUDA 版本，来源于 requirements.txt；如需 CPU 请在执行前设置 `CPU=1`）
+  - 下载默认模型：
+    - 说话人嵌入（3dspeaker 16k ONNX）到 `models/speaker-recognition/`
+    - SenseVoice（Sherpa-ONNX，多语 ASR）到 `models/asr/`
+  - 提示你准备 LibriMix/Libri3Mix 数据集并设置 `LIBRIMIX_ROOT`（不自动下载）
+
+可选：CPU-only 环境
+
+```bash
+CPU=1 bash install.sh  # 安装 CPU 版本依赖（torch/torchaudio/onnxruntime CPU）
+```
 
 ### 运行主程序与基线测试
 
@@ -70,17 +77,17 @@ export HF_TOKEN=xxxxxxxx    # 若 pyannote 需要鉴权
 
 segments 记录字段说明：
 
-| 字段        | 说明                                                                                 |
-| ----------- | ------------------------------------------------------------------------------------ |
-| wav         | 原始混合音频的文件路径                                                               |
-| start / end | 片段起止时间 (秒, 浮点, 3 位小数)                                                    |
-| kind        | `clean`（未判定重叠或时长低于最小重叠门限）或 `overlap`                              |
-| stream      | `null`（clean 片段）或 0/1（两路分离）/ 0/1/2（三路分离）                            |
-| text        | ASR 输出文本（解码方法默认 greedy_search）                                           |
-| asr_time    | 该片段（或分支）ASR 解码耗时（秒，浮点）                                             |
-| sv_score    | 说话人相似度分数（若启用目标说话人筛选时会给出，否则为空）                           |
-| matched     | 是否判定为目标说话人（1/0；未启用筛选时恒为 1）                                      |
-| match       | 匹配标签（当使用目标说话人筛选时为 `target` 或 `unknown`；三路分离脚本会写入该字段） |
+| 字段            | 说明                                                                     |
+| --------------- | ------------------------------------------------------------------------ |
+| wav             | 原始混合音频的文件路径                                                   |
+| start / end     | 片段起止时间 (秒, 浮点, 3 位小数)                                        |
+| kind            | `clean`（未判定重叠或时长低于最小重叠门限）或 `overlap`                  |
+| stream          | `null`（clean 片段）或 0/1（两路分离）/ 0/1/2（三路分离）                |
+| text            | ASR 输出文本（解码方法默认 greedy_search）                               |
+| asr_time        | 该片段（或分支）ASR 解码耗时（秒，浮点）                                 |
+| sv_score        | 说话人相似度分数（用于目标说话人筛选的余弦分数）                         |
+| target_src      | 本次混合中随机选作“目标说话人”的源音频绝对路径（LibriMix 根 + 相对路径） |
+| target_src_text | 该目标源整段的 ASR 输出文本（每个混合仅计算一次，复用于该混合的所有行）  |
 
 summary.json 主要字段：
 
@@ -114,7 +121,7 @@ summary.json 主要字段：
 - CLI 中 `--speaker-file`, `--test-list`, `--ref-text-list` 已删除。
 - CLI 中 `--threshold` 仅为兼容占位，可忽略。
 
-#### 三路分离（LibriMix/Libri3Mix，支持目标说话人筛选，可选）
+#### 三路分离（LibriMix/Libri3Mix，内置目标说话人筛选）
 
 我们提供了三路分离脚本与一键运行脚本，基于 torchaudio 的 LibriMix 数据集接口，默认采样率 16k：
 
@@ -124,20 +131,60 @@ export LIBRIMIX_ROOT=/abs/path/to/LibriMix   # 指向包含 Libri3Mix/Libri2Mix 
 bash ./test_overlap_3src.sh
 ```
 
-可选：启用目标说话人筛选（只对目标的分支做 ASR；clean 段也会筛选）：
+可选：指定声纹模型与阈值（用于匹配打分与筛选）
 
 ```bash
-export SPK_EMBED_MODEL=../../models/speaker-recongition/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
-export ENROLL_WAVS=/path/to/target1.wav,/path/to/target2.wav  # 可逗号分隔或多次传参
+export SPK_EMBED_MODEL=../../models/speaker-recognition/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
 export SV_THRESHOLD=0.6
+bash ./test_overlap_3src.sh
+```
+
+可选：固定随机性（复现实验）
+
+- Python 直跑：
+
+```bash
+python3 ./offline_overlap_3src.py \
+  --librimix-root "$LIBRIMIX_ROOT" \
+  --spk-embed-model ../../models/speaker-recognition/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx \
+  --sense-voice ../../models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx \
+  --tokens ../../models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt \
+  --provider cuda --num-threads 2 \
+  --osd-backend pyannote --sep-backend asteroid \
+  --max-files 100 --min-overlap-dur 0.2 \
+  --seed 123
+```
+
+- 包装脚本也支持通过环境变量传入 SEED：
+
+```bash
+cd scripts/osd
+export LIBRIMIX_ROOT=/abs/path/to/LibriMix
+export SEED=123
 bash ./test_overlap_3src.sh
 ```
 
 说明：
 
-- 三路脚本为 `offline_overlap_3src.py`，会对 overlap 片段分离出 3 路，并基于声纹注册（`SpeakerEmbeddingManager`）仅保留与目标匹配的一路进行 ASR；若无匹配则跳过该段。
-- 若未提供注册信息，脚本将对三路全部执行 ASR（与两路逻辑一致）。
-- 三路脚本在 `segments.csv` 中会额外写入 `match` 列（`target`/`unknown`），并在 `summary.json` 中增加命中/未命中统计字段（见上表）。
+- 三路脚本 `offline_overlap_3src.py` 会对每个混合随机选取其中一条源语音作为“目标说话人”，计算其嵌入并注册到 `SpeakerEmbeddingManager`，随后仅对与目标匹配的 clean/overlap 片段执行 ASR；未命中则跳过并计入 miss（片段级明细默认不输出未命中行，见 summary 命中统计）。
+- `segments.csv` 额外写入两列：`target_src`（被选为目标的源音频绝对路径）与 `target_src_text`（该目标源整段 ASR 文本）。
+- 可选开启三路分离质量评估：
+
+```bash
+export EVAL_SEP=1           # 写入 metrics.json 的 SI-SDR/SI-SDRi 聚合统计
+export SAVE_SEP_DETAILS=1   # 额外输出 overlap_sep_details.csv（每段明细，含 PIT 选路）
+bash ./test_overlap_3src.sh
+```
+
+评估开启后，`metrics.json` 中会增加：
+
+- `sep_eval_k_refs=3`, `sep_eval_segments`
+- `sep_sisdr_mean/median/std`, `sep_sisdri_mean/median/std`
+
+注意：
+
+- 输出 `segments.jsonl/csv` 的 `wav` 字段已统一为绝对路径（若为内部占位如 `index:*` 则保持原样）。
+- `--max-files` 限制处理的“混合条目数”，并不保证输出行数相同；因为仅输出“命中目标说话人”的段，未命中将统计在 summary 而不写入 segments。
 
 ### 评估（带源语音，对 OSD/分离/可选 ASR 进行量化）
 

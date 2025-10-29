@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 import os
+import random
 import threading
 import time
 from datetime import datetime
@@ -25,6 +26,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 try:
     import torchaudio
@@ -54,6 +58,101 @@ try:
     import sherpa_onnx  # type: ignore
 except Exception:  # pragma: no cover
     sherpa_onnx = None  # type: ignore
+
+
+# -------------------------------
+# Separation quality (SI-SDR) utils
+# -------------------------------
+def _si_sdr(reference: np.ndarray, estimation: np.ndarray) -> float:
+    """Scale-Invariant SDR in dB.
+
+    - Zero-mean both signals
+    - Project estimation onto reference
+    - Compute 10*log10(P_signal / P_noise)
+    """
+    if reference.shape != estimation.shape:
+        n = min(reference.shape[-1], estimation.shape[-1])
+        reference = reference[..., :n]
+        estimation = estimation[..., :n]
+    ref = reference.astype(np.float32) - float(np.mean(reference))
+    est = estimation.astype(np.float32) - float(np.mean(estimation))
+    ref_energy = float(np.sum(ref**2)) + 1e-12
+    if ref_energy <= 0:
+        return float("nan")
+    scale = float(np.dot(est, ref)) / ref_energy
+    proj = scale * ref
+    e_noise = est - proj
+    num = float(np.sum(proj**2)) + 1e-12
+    den = float(np.sum(e_noise**2)) + 1e-12
+    return 10.0 * float(np.log10(num / den))
+
+
+def _pit_best_si_sdr_k(
+    refs: List[np.ndarray], preds: List[np.ndarray]
+) -> Tuple[float, List[int]]:
+    """PIT for K references (K=2 or 3) vs N predictions.
+
+    Returns best_mean_sdr and assigned pred indices of length K.
+    """
+    K = len(refs)
+    if K not in (2, 3):
+        raise ValueError("_pit_best_si_sdr_k supports K=2 or 3")
+    if len(preds) < K:
+        return float("nan"), []
+
+    # Precompute SDR matrix (K x N)
+    sdr_mat = [[_si_sdr(refs[i], p) for p in preds] for i in range(K)]
+
+    import itertools
+
+    N = len(preds)
+    best = -1e9
+    best_idx: List[int] = []
+    for cols in itertools.combinations(range(N), K):
+        # For chosen columns, check all permutations to assign K refs
+        for perm in itertools.permutations(range(K), K):
+            s = 0.0
+            valid = True
+            for r_i, c_i in enumerate(cols):
+                sdr_val = sdr_mat[perm[r_i]][c_i]
+                if np.isnan(sdr_val):
+                    valid = False
+                    break
+                s += sdr_val
+            if not valid:
+                continue
+            mean_sdr = s / float(K)
+            if mean_sdr > best:
+                best = mean_sdr
+                # Map refs order (0..K-1) to selected pred indices
+                assigned = [cols[perm.index(i)] for i in range(K)]
+                best_idx = list(assigned)
+    if best_idx == []:
+        return float("nan"), []
+    return float(best), best_idx
+
+
+def _compute_sdr_improvement_pit_k(
+    mix_chunk: np.ndarray, refs: List[np.ndarray], preds: List[np.ndarray]
+) -> Tuple[float, float, List[int]]:
+    """Compute PIT-best SI-SDR and SI-SDRi for K refs (2 or 3).
+
+    - base: mean of SI-SDR(mix_chunk, ref_i)
+    - best: PIT-best mean SI-SDR(refs, preds)
+    Returns (best, best - base, assigned_indices)
+    """
+    if len(refs) not in (2, 3):
+        return float("nan"), float("nan"), []
+    base_vals = []
+    for r in refs:
+        base_vals.append(_si_sdr(r, mix_chunk))
+    if any(np.isnan(x) for x in base_vals):
+        return float("nan"), float("nan"), []
+    base = float(np.mean(base_vals))
+    best, indices = _pit_best_si_sdr_k(refs, preds)
+    if np.isnan(best):
+        return float("nan"), float("nan"), []
+    return float(best), float(best - base), indices
 
 
 def _log(msg: str):
@@ -126,6 +225,12 @@ def parse_args():
         default=0,
         help="Limit number of mixtures processed (0=all)",
     )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=-1,
+        help="Random seed for reproducibility (>=0 to enable)",
+    )
 
     # OSD
     p.add_argument("--osd-backend", default="pyannote")
@@ -152,17 +257,11 @@ def parse_args():
     p.add_argument("--num-threads", type=int, default=1)
     p.add_argument("--provider", default="cpu")
 
-    # Target-speaker (optional)
+    # Target-speaker (auto from dataset)
     p.add_argument(
         "--spk-embed-model",
         required=True,
         help="Speaker embedding ONNX model path (REQUIRED)",
-    )
-    p.add_argument(
-        "--enroll-wavs",
-        action="append",
-        required=True,
-        help="Target enrollment wav(s). REQUIRED. Can repeat or comma-separated",
     )
     p.add_argument(
         "--sv-threshold",
@@ -179,6 +278,22 @@ def parse_args():
     p.add_argument("--enable-metrics", action="store_true")
     p.add_argument("--monitor-interval", type=float, default=0.5)
     p.add_argument("--metrics-out", default="metrics.json")
+    # Separation quality evaluation (optional)
+    p.add_argument(
+        "--eval-separation",
+        action="store_true",
+        help="Evaluate separation quality (SI-SDR / SI-SDRi) on predicted overlap segments using LibriMix references (K=3)",
+    )
+    p.add_argument(
+        "--save-sep-details",
+        action="store_true",
+        help="Save per-overlap segment separation details CSV (sisdr/sisdri with PIT indices)",
+    )
+    p.add_argument(
+        "--sep-details-out",
+        default="overlap_sep_details.csv",
+        help="Filename for per-segment separation evaluation CSV",
+    )
     return p.parse_args()
 
 
@@ -188,6 +303,18 @@ def main():
         raise RuntimeError(
             "torchaudio and torchaudio.datasets.LibriMix are required. Please install torchaudio matching your torch version."
         )
+
+    # Set random seed for reproducibility if provided
+    try:
+        if getattr(args, "seed", -1) is not None and int(args.seed) >= 0:
+            random.seed(int(args.seed))
+            np.random.seed(int(args.seed))
+            try:
+                torch.manual_seed(int(args.seed))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     base_out_dir = Path(args.out_dir)
     base_out_dir.mkdir(parents=True, exist_ok=True)
@@ -213,76 +340,22 @@ def main():
         n_src=3,
     )
 
-    # Enrollment (optional)
-    extractor: Any = None
+    # Build speaker embedding extractor (required)
+    if sherpa_onnx is None:
+        raise RuntimeError(
+            "sherpa_onnx is required for speaker embedding. Please install sherpa_onnx."
+        )
+    se_config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+        model=args.spk_embed_model,
+        num_threads=args.num_threads,
+        debug=getattr(args, "debug", False),
+        provider=args.provider,
+    )
+    if not se_config.validate():
+        raise ValueError(f"Invalid speaker embedding config: {se_config}")
+    extractor = sherpa_onnx.SpeakerEmbeddingExtractor(se_config)
     manager: Any = None
-    enrolled_vec = None
     enrolled_vec_norm = None
-    enroll_list: List[str] = []
-    if args.spk_embed_model:
-        if sherpa_onnx is None:
-            raise RuntimeError(
-                "sherpa_onnx is required for speaker enrollment. Please install sherpa_onnx."
-            )
-        for item in args.enroll_wavs or []:
-            for pth in str(item).split(","):
-                pth = pth.strip()
-                if pth:
-                    enroll_list.append(pth)
-        if not enroll_list:
-            raise RuntimeError(
-                "--enroll-wavs is required and must contain at least one wav path"
-            )
-        if enroll_list:
-            # Build sherpa_onnx extractor and manager (follow SpeakerEmbeddingManager usage)
-            se_config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                model=args.spk_embed_model,
-                num_threads=args.num_threads,
-                debug=getattr(args, "debug", False),
-                provider=args.provider,
-            )
-            if not se_config.validate():
-                raise ValueError(f"Invalid speaker embedding config: {se_config}")
-            extractor = sherpa_onnx.SpeakerEmbeddingExtractor(se_config)
-            manager = sherpa_onnx.SpeakerEmbeddingManager(extractor.dim)
-
-            def _compute_emb(wav_np: np.ndarray, sr: int) -> np.ndarray:
-                s = extractor.create_stream()
-                s.accept_waveform(sr, wav_np)
-                s.input_finished()
-                assert extractor.is_ready(s)
-                emb = np.array(extractor.compute(s), dtype=np.float32)
-                return l2norm(emb)
-
-            acc = None
-            n_ok = 0
-            for ep in enroll_list:
-                try:
-                    wav, sr = torchaudio.load(ep)
-                    wav_np, sr = _ensure_sr_np(wav, sr, G_SAMPLE_RATE)
-                    emb = _compute_emb(wav_np, sr)
-                    acc = emb if acc is None else (acc + emb)
-                    n_ok += 1
-                except Exception as _e:
-                    _log(f"Enroll failed for {ep}: {_e}")
-            if acc is not None and n_ok > 0:
-                enrolled_vec = (acc / float(n_ok)).astype(np.float32)
-                enrolled_vec_norm = l2norm(enrolled_vec)
-                # Register into manager with label 'target'
-                _ok = manager.add("target", enrolled_vec)
-                if not _ok:
-                    _log(
-                        "Failed to register target speaker into Manager; filtering disabled."
-                    )
-                    raise RuntimeError("Failed to register target speaker into Manager")
-                else:
-                    _log(
-                        f"Enrolled target speaker from {n_ok} file(s). Threshold={args.sv_threshold}"
-                    )
-            else:
-                raise RuntimeError(
-                    "No valid enrollment wav(s). Please check --enroll-wavs files"
-                )
 
     # Dataset
     ds = LibriMix(
@@ -313,8 +386,8 @@ def main():
             "text",
             "asr_time",
             "sv_score",
-            "matched",
-            "match",
+            "target_src",
+            "target_src_text",
         ]
     )
 
@@ -339,6 +412,29 @@ def main():
     time_osd = 0.0
     time_sep = 0.0
     time_asr = 0.0
+
+    # Separation evaluation accumulators (K=3)
+    sep_eval_enabled = getattr(args, "eval_separation", False)
+    sep_sisdr_list: List[float] = []
+    sep_sisdri_list: List[float] = []
+    sep_details_writer = None
+    sep_details_fh = None
+    if sep_eval_enabled and getattr(args, "save_sep_details", False):
+        sep_details_fh = (out_dir / args.sep_details_out).open(
+            "w", newline="", encoding="utf-8"
+        )
+        sep_details_writer = csv.writer(sep_details_fh)
+        sep_details_writer.writerow(
+            [
+                "wav",
+                "start",
+                "end",
+                "k_refs",
+                "sisdr",
+                "sisdri",
+                "selected_pred_indices",
+            ]
+        )
 
     class _ResourceMonitor:
         def __init__(self, interval: float):
@@ -426,8 +522,23 @@ def main():
         # Optional: file path via metadata
         try:
             _sr_meta, mix_path, _src_paths = ds.get_metadata(idx)
+            src_paths = list(_src_paths) if _src_paths is not None else []
         except Exception:
             mix_path = f"index:{idx}"
+            src_paths = []
+
+        # Resolve absolute path for outputs when available; keep index:* as-is
+        def _resolve_mix_path(root: str, p: str) -> str:
+            try:
+                if isinstance(p, str) and (
+                    p.startswith("index:") or Path(p).is_absolute()
+                ):
+                    return p
+                return str(Path(root) / p)
+            except Exception:
+                return p
+
+        abs_mix_path = _resolve_mix_path(str(ds.root), mix_path)
 
         # OSD on mixture at dataset SR
         mix_np, sr = _ensure_sr_np(mix_wav, sr_item, G_SAMPLE_RATE)
@@ -439,6 +550,49 @@ def main():
         time_osd += time.time() - t_osd0
         if not segs:
             segs = [(0.0, dur, False)]
+
+        # Select a random source from this mixture as target enrollment
+        target_src_idx = 0
+        target_src_abs = None
+        target_src_text = ""
+        try:
+            if _sources and len(_sources) > 0:
+                target_src_idx = random.randrange(len(_sources))
+            # Join absolute path for CSV marking
+            if src_paths and len(src_paths) > target_src_idx:
+                target_src_abs = str(Path(ds.root) / src_paths[target_src_idx])
+            # Build Manager per mixture with chosen target embedding
+            manager = sherpa_onnx.SpeakerEmbeddingManager(extractor.dim)
+
+            def _compute_emb(wav_np: np.ndarray, sr: int) -> np.ndarray:
+                s = extractor.create_stream()
+                s.accept_waveform(sr, wav_np)
+                s.input_finished()
+                assert extractor.is_ready(s)
+                emb = np.array(extractor.compute(s), dtype=np.float32)
+                return l2norm(emb)
+
+            # Compute target embedding from the full chosen source audio
+            src_wav_t = _sources[target_src_idx]
+            src_np_t, _ = _ensure_sr_np(src_wav_t, sr_item, G_SAMPLE_RATE)
+            enrolled_vec = _compute_emb(src_np_t, G_SAMPLE_RATE)
+            enrolled_vec_norm = l2norm(enrolled_vec)
+            _ = manager.add("target", enrolled_vec)
+            _log(
+                f"Selected target source idx={target_src_idx} path={target_src_abs if target_src_abs else 'N/A'}"
+            )
+            # Compute ASR on the selected target source (once per mixture)
+            try:
+                st_tgt = asr.create_stream()
+                st_tgt.accept_waveform(G_SAMPLE_RATE, src_np_t)
+                asr.decode_stream(st_tgt)
+                target_src_text = st_tgt.result.text or ""
+            except Exception as _e:
+                _log(f"ASR on target_src failed: {_e}")
+        except Exception as _e:
+            _log(f"Failed to prepare target enrollment from sources: {_e}")
+            enrolled_vec_norm = None
+            manager = None
 
         for s, e, is_olap in segs:
             if e - s <= 0:
@@ -482,7 +636,7 @@ def main():
                 text = st.result.text
                 asr_t1 = time.time()
                 rec = {
-                    "wav": mix_path,
+                    "wav": abs_mix_path,
                     "start": round(s, 3),
                     "end": round(e, 3),
                     "kind": "clean",
@@ -490,12 +644,13 @@ def main():
                     "text": text,
                     "asr_time": round(asr_t1 - asr_t0, 3),
                     "sv_score": (round(sv_score, 4) if sv_score is not None else None),
-                    "matched": True,
+                    "target_src": target_src_abs,
+                    "target_src_text": target_src_text,
                 }
                 seg_jsonl.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 csv_writer.writerow(
                     [
-                        mix_path,
+                        abs_mix_path,
                         f"{s:.3f}",
                         f"{e:.3f}",
                         "clean",
@@ -503,12 +658,13 @@ def main():
                         text,
                         f"{(asr_t1 - asr_t0):.3f}",
                         f"{rec['sv_score'] if rec['sv_score'] is not None else ''}",
-                        1,
-                        "target",
+                        target_src_abs if target_src_abs else "",
+                        target_src_text,
                     ]
                 )
                 n_segments += 1
                 n_clean_segments += 1
+                n_matched_segments += 1
                 total_clean_audio_sec += e - s
                 total_matched_audio_sec += e - s
                 time_asr += asr_t1 - asr_t0
@@ -522,6 +678,44 @@ def main():
                 seg_dur = e - s
                 n_seen_overlap_segments += 1
                 total_seen_overlap_audio_sec += seg_dur
+                total_overlap_audio_sec += seg_dur
+
+                # Separation quality evaluation (K=3) using LibriMix source references
+                if sep_eval_enabled and src_paths and len(branches) >= 3:
+                    refs: List[np.ndarray] = []
+                    try:
+                        for sp in src_paths[:3]:  # expect 3 sources
+                            abs_p = str(Path(ds.root) / sp)
+                            sw, ssr = torchaudio.load(abs_p)
+                            snp, _ = _ensure_sr_np(sw, ssr, sr)
+                            # slice to segment
+                            s_i_ref = int(s * sr)
+                            e_i_ref = int(e * sr)
+                            refs.append(snp[s_i_ref:e_i_ref])
+                        # preds are branches already sliced chunk-wise
+                        preds_np = [np.asarray(b, dtype=np.float32) for b in branches]
+                        best, sdri, idx_sel = _compute_sdr_improvement_pit_k(
+                            chunk, refs, preds_np
+                        )
+                        if not (np.isnan(best) or np.isnan(sdri)):
+                            sep_sisdr_list.append(float(best))
+                            sep_sisdri_list.append(float(sdri))
+                            if sep_details_writer is not None:
+                                sep_details_writer.writerow(
+                                    [
+                                        mix_path,
+                                        f"{s:.3f}",
+                                        f"{e:.3f}",
+                                        3,
+                                        f"{best:.4f}",
+                                        f"{sdri:.4f}",
+                                        ";".join(str(i) for i in idx_sel),
+                                    ]
+                                )
+                    except Exception as _e:
+                        _log(
+                            f"Separation eval failed for {mix_path} [{s:.3f},{e:.3f}]: {_e}"
+                        )
 
                 if extractor is not None and enrolled_vec_norm is not None:
                     scores: List[float] = []
@@ -577,7 +771,7 @@ def main():
                     text = st.result.text
                     asr_t1 = time.time()
                     rec = {
-                        "wav": mix_path,
+                        "wav": abs_mix_path,
                         "start": round(s, 3),
                         "end": round(e, 3),
                         "kind": "overlap",
@@ -587,12 +781,13 @@ def main():
                         "sv_score": (
                             round(sv_score, 4) if sv_score is not None else None
                         ),
-                        "matched": matched,
+                        "target_src": target_src_abs,
+                        "target_src_text": target_src_text,
                     }
                     seg_jsonl.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     csv_writer.writerow(
                         [
-                            mix_path,
+                            abs_mix_path,
                             f"{s:.3f}",
                             f"{e:.3f}",
                             "overlap",
@@ -600,8 +795,8 @@ def main():
                             text,
                             f"{(asr_t1 - asr_t0):.3f}",
                             f"{rec['sv_score'] if rec['sv_score'] is not None else ''}",
-                            1,
-                            "target",
+                            target_src_abs if target_src_abs else "",
+                            target_src_text,
                         ]
                     )
                     n_segments += 1
@@ -614,8 +809,14 @@ def main():
     # Close outputs
     seg_jsonl.close()
     pred_csv.close()
+    if sep_eval_enabled and sep_details_fh is not None:
+        try:
+            sep_details_fh.close()
+        except Exception:
+            pass
 
-    elapsed = time.time()
+    # Total elapsed wall-clock time
+    elapsed_total = time.time() - t0_all
     # monitor stop and aggregate
     if args.enable_metrics and psutil is not None:
         try:
@@ -627,7 +828,7 @@ def main():
         resource_stats = {}
 
     # Derive metrics
-    rtf_total = (elapsed - 0.0) / total_audio_sec if total_audio_sec > 0 else None
+    rtf_total = elapsed_total / total_audio_sec if total_audio_sec > 0 else None
     rtf_asr = time_asr / total_audio_sec if total_audio_sec > 0 else None
 
     def _maybe_round(x, nd=4):
@@ -637,6 +838,17 @@ def main():
             return round(x, nd)
         except Exception:
             return None
+
+    def _agg(vals: List[float]) -> Dict[str, Optional[float]]:
+        if not vals:
+            return {"mean": None, "median": None, "std": None, "count": 0}
+        arr = np.asarray(vals, dtype=np.float32)
+        return {
+            "mean": round(float(np.mean(arr)), 4),
+            "median": round(float(np.median(arr)), 4),
+            "std": round(float(np.std(arr)), 4),
+            "count": int(arr.size),
+        }
 
     metrics: Dict[str, Any] = {
         "total_audio_sec": round(total_audio_sec, 3),
@@ -673,6 +885,22 @@ def main():
         "rtf_total": _maybe_round(rtf_total, 4),
         "rtf_asr": _maybe_round(rtf_asr, 4),
     }
+    # Attach separation evaluation aggregates if enabled
+    if sep_eval_enabled:
+        sisdr_stats = _agg(sep_sisdr_list)
+        sisdri_stats = _agg(sep_sisdri_list)
+        metrics.update(
+            {
+                "sep_eval_k_refs": 3,
+                "sep_eval_segments": sisdr_stats["count"],
+                "sep_sisdr_mean": sisdr_stats["mean"],
+                "sep_sisdr_median": sisdr_stats["median"],
+                "sep_sisdr_std": sisdr_stats["std"],
+                "sep_sisdri_mean": sisdri_stats["mean"],
+                "sep_sisdri_median": sisdri_stats["median"],
+                "sep_sisdri_std": sisdri_stats["std"],
+            }
+        )
     metrics.update(resource_stats)
 
     summary = {
