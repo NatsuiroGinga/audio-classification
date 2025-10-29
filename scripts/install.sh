@@ -66,6 +66,7 @@ echo '[install] Models ready.'
 echo '[install] Dataset setup:'
 echo '  - 三路分离脚本依赖 LibriMix/Libri3Mix，请自行准备并设置环境变量 LIBRIMIX_ROOT 指向其上级目录。'
 echo '  - 参考：https://github.com/JorisCos/LibriMix'
+echo '  - 注意：因 LibriMix 数据集过大，可以选择不同子集下载以减少不必要的存储占用。'
 echo '  - 示例：export LIBRIMIX_ROOT=/abs/path/to/LibriMix'
 
 echo '[install] Done.'

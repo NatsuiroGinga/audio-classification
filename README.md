@@ -23,7 +23,7 @@ bash install.sh
   - 下载默认模型：
     - 说话人嵌入（3dspeaker 16k ONNX）到 `models/speaker-recognition/`
     - SenseVoice（Sherpa-ONNX，多语 ASR）到 `models/asr/`
-  - 提示你准备 LibriMix/Libri3Mix 数据集并设置 `LIBRIMIX_ROOT`（不自动下载）
+  - 提示你准备 LibriMix/Libri3Mix 数据集并设置 `LIBRIMIX_ROOT`（因 LibriMix 数据集过大，所以不自动下载）
 
 可选：CPU-only 环境
 
