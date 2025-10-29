@@ -1,10 +1,15 @@
-"""Model definitions for Speaker + ASR pipeline.
+"""Speaker + ASR 相关模型定义。
 
-Contains SpeakerASRModels which encapsulates:
-- ASR model loading (paraformer | sense-voice | transducer)
-- Speaker embedding extractor & enrollment
-- Identification (threshold search + top1 cosine score)
+本模块主要提供：
+- ASR 模型工厂（paraformer / sense-voice / transducer 三选一）
+- 说话人嵌入提取器与注册（enroll）
+- 基于余弦相似度的简单识别接口
+
+说明：
+- 这里的 ASR 由 sherpa-onnx 提供，输入为 CPU 上的 numpy 波形（内部会处理与 GPU 的交互）。
+- "provider" 参数用于构造说话人嵌入提取器；ASR 工厂当前不直接使用 provider（由 ONNX Runtime 侧决定）。
 """
+
 from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 import os
@@ -14,6 +19,7 @@ import sherpa_onnx
 
 try:  # Optional torch usage for accepting GPU tensors
     import torch  # type: ignore
+
     _TORCH_AVAILABLE = True
 except Exception:  # pragma: no cover - torch optional
     torch = None
@@ -43,6 +49,23 @@ def create_asr_model(
     language: str,
     provider: str,
 ) -> sherpa_onnx.OfflineRecognizer:
+    """创建并返回一个离线 ASR 识别器（从 sherpa-onnx）。
+
+    只会在以下三种来源中择一创建：
+    - Paraformer（提供 ``paraformer`` 与 ``tokens``）
+    - SenseVoice（提供 ``sense_voice`` 与 ``tokens``）
+    - Transducer（RNN-T，提供 ``encoder``/``decoder``/``joiner`` 与 ``tokens``）
+
+    参数（节选）：
+    - num_threads: 计算线程数
+    - feature_dim: 特征维度（与模型要求一致，如 80）
+    - decoding_method: 解码方式（如 "greedy_search"）
+    - language: 语言设置（SenseVoice 可用）
+    - provider: 推理后端（如 "cpu"/"cuda"）
+
+    返回：
+    - sherpa_onnx.OfflineRecognizer 实例
+    """
     if paraformer:
         return sherpa_onnx.OfflineRecognizer.from_paraformer(
             paraformer=paraformer,
@@ -80,6 +103,16 @@ def create_asr_model(
 def create_extractor_model(
     *, model: str, num_threads: int, provider: str, debug: bool
 ) -> sherpa_onnx.SpeakerEmbeddingExtractor:
+    """创建并返回说话人嵌入提取器。
+
+    参数：
+    - model: 说话人嵌入 onnx 模型路径
+    - num_threads: 计算线程数
+    - provider: 推理后端（如 "cpu"/"cuda"）
+    - debug: 调试开关
+
+    异常：当配置非法时会抛出 ValueError。
+    """
     cfg = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
         model=model,
         num_threads=num_threads,
@@ -92,12 +125,29 @@ def create_extractor_model(
 
 
 class SpeakerASRModels:
-    """Encapsulates ASR + Speaker embedding models and operations."""
+    """封装 ASR + 说话人嵌入的统一接口。
+
+    职责：
+    - 初始化 ASR 与说话人嵌入提取器
+    - 提供注册（enroll）多条说话人语音并聚合为均值嵌入
+    - 提供简单的识别（search + top1 余弦分数）
+    - 提供 ASR 推理接口
+    """
 
     def __init__(self, args):
+        """构造函数。
+
+        期望从 ``args`` 中读取以下字段：
+        - ASR 相关：paraformer / sense_voice / (encoder,decoder,joiner), tokens,
+          num_threads, feature_dim, decoding_method, language, provider
+        - 说话人嵌入：model, num_threads, provider
+        - 调试：debug
+        """
         self.args = args
-        self.provider = getattr(args, 'provider', 'cpu')
-        self.using_cuda = 'cuda' in self.provider.lower() or 'gpu' in self.provider.lower()
+        self.provider = getattr(args, "provider", "cpu")
+        self.using_cuda = (
+            "cuda" in self.provider.lower() or "gpu" in self.provider.lower()
+        )
         self.asr = create_asr_model(
             paraformer=getattr(args, "paraformer", ""),
             sense_voice=getattr(args, "sense_voice", ""),
@@ -126,12 +176,17 @@ class SpeakerASRModels:
     # Internal helpers for tensor/array handling
     # ------------------------------------------------------------------
     def _to_numpy_waveform(self, samples) -> np.ndarray:
-        """Accept np.ndarray or torch.Tensor (any device) and return float32 1-D numpy array.
+        """将输入波形规整为 float32 的一维 numpy 数组。
 
-        If a torch CUDA tensor is given, it is moved to CPU (non_blocking if possible).
-        This is the narrowest integration point before handing audio to sherpa_onnx.
-        NOTE: sherpa_onnx Streaming/Offline APIs expect CPU numpy arrays; ONNX Runtime
-        will handle host->device transfer internally if provider is CUDA.
+        支持 np.ndarray / torch.Tensor（任意设备）。
+        - 若为 torch.Tensor：
+          - 展平成一维
+          - 转为 float32
+          - 如在 CUDA 上则搬到 CPU（non_blocking=True）
+        - 其他类型：尽量通过 np.asarray 转换为 float32 一维
+
+        sherpa-onnx 的离线/流式 API 期望 CPU 上的 numpy 输入，
+        若底层使用 CUDA Provider，会在 ORT 内部完成 Host->Device 的搬运。
         """
         if isinstance(samples, np.ndarray):
             if samples.dtype != np.float32:
@@ -141,10 +196,10 @@ class SpeakerASRModels:
             if samples.ndim > 1:
                 samples = samples.view(-1)
             # dtype normalize
-            if samples.dtype != getattr(torch, 'float32'):
+            if samples.dtype != getattr(torch, "float32"):
                 samples = samples.float()
-            if samples.device.type != 'cpu':
-                samples = samples.detach().to('cpu', non_blocking=True)
+            if samples.device.type != "cpu":
+                samples = samples.detach().to("cpu", non_blocking=True)
             return samples.numpy()
         # Fallback: try to coerce
         arr = np.asarray(samples, dtype=np.float32).reshape(-1)
@@ -154,29 +209,30 @@ class SpeakerASRModels:
     # Introspection / debug representation
     # ------------------------------------------------------------------
     def __repr__(self) -> str:  # pragma: no cover - debug utility
+        """返回便于调试的字符串描述（包含 ASR/Embedding 关键配置）。"""
         args = self.args
         # 判定 ASR 类型
-        if getattr(args, 'paraformer', ''):
-            asr_type = 'paraformer'
-            asr_model_path = getattr(args, 'paraformer')
-        elif getattr(args, 'sense_voice', ''):
-            asr_type = 'sense_voice'
-            asr_model_path = getattr(args, 'sense_voice')
-        elif getattr(args, 'encoder', ''):
-            asr_type = 'transducer'
+        if getattr(args, "paraformer", ""):
+            asr_type = "paraformer"
+            asr_model_path = getattr(args, "paraformer")
+        elif getattr(args, "sense_voice", ""):
+            asr_type = "sense_voice"
+            asr_model_path = getattr(args, "sense_voice")
+        elif getattr(args, "encoder", ""):
+            asr_type = "transducer"
             asr_model_path = f"encoder={getattr(args,'encoder')}|decoder={getattr(args,'decoder')}|joiner={getattr(args,'joiner')}"
         else:
-            asr_type = 'unknown'
-            asr_model_path = ''
-        provider = getattr(args, 'provider', 'cpu')
-        using_gpu = 'cuda' in provider.lower()
-        emb_model = getattr(args, 'model', '')
+            asr_type = "unknown"
+            asr_model_path = ""
+        provider = getattr(args, "provider", "cpu")
+        using_gpu = "cuda" in provider.lower()
+        emb_model = getattr(args, "model", "")
         num_spk = len(self.enrolled)
-        dim = getattr(self.extractor, 'dim', None)
-        cache_dir = getattr(args, 'emb_cache_dir', '') or 'N/A'
-        loaded_precomputed = bool(getattr(args, 'load_speaker_embeds', ''))
+        dim = getattr(self.extractor, "dim", None)
+        cache_dir = getattr(args, "emb_cache_dir", "") or "N/A"
+        loaded_precomputed = bool(getattr(args, "load_speaker_embeds", ""))
         lines = [
-            'SpeakerASRModels(',
+            "SpeakerASRModels(",
             f"  asr_type='{asr_type}',",
             f"  asr_model='{asr_model_path}',",
             f"  speaker_embedding_model='{emb_model}',",
@@ -187,20 +243,24 @@ class SpeakerASRModels:
             f"  loaded_precomputed_embeds={loaded_precomputed},",
             f"  threshold={getattr(args,'threshold', None)},",
             f"  num_threads={getattr(args,'num_threads', None)}",
-            ')'
+            ")",
         ]
-        return '\n'.join(lines)
+        return "\n".join(lines)
 
     def enroll_from_map(self, spk_map: Dict[str, List[str]], load_audio_func):
-        """Enroll speakers, with optional per-wav embedding cache & precomputed speaker loads.
+        """根据说话人 -> 语音文件列表的映射批量注册说话人。
 
-        Args expects these optional attributes on self.args:
-            emb_cache_dir: str, directory to cache per-wav embeddings (*.npy)
-            load_speaker_embeds: path to npz of {spk: vector}
-            save_speaker_embeds: path to save aggregated embeddings
+        支持两种路径：
+        1) 直接加载预计算的嵌入（npz）：``args.load_speaker_embeds``
+        2) 逐 wav 计算并做均值聚合（可选缓存到 ``args.emb_cache_dir``）
+
+        额外参数（通过 self.args 传入）：
+        - emb_cache_dir: 为每条 wav 的嵌入建立 *.npy 缓存，加速重复实验
+        - load_speaker_embeds: 直接加载 {speaker: embedding} 的 npz 文件
+        - save_speaker_embeds: 将当前聚合后的 {speaker: embedding} 持久化为 npz
         """
         # If loading precomputed speaker embeddings
-        load_npz = getattr(self.args, 'load_speaker_embeds', '')
+        load_npz = getattr(self.args, "load_speaker_embeds", "")
         if load_npz:
             data = np.load(load_npz, allow_pickle=True)
             for spk in data.files:
@@ -208,10 +268,12 @@ class SpeakerASRModels:
                 self.enrolled[spk] = vec
                 self.enrolled_norm[spk] = l2norm(vec)
                 if not self.manager.add(spk, vec):
-                    raise RuntimeError(f"Failed to add speaker {spk} from preloaded embeds")
+                    raise RuntimeError(
+                        f"Failed to add speaker {spk} from preloaded embeds"
+                    )
             return
 
-        cache_dir = getattr(self.args, 'emb_cache_dir', '')
+        cache_dir = getattr(self.args, "emb_cache_dir", "")
         use_cache = bool(cache_dir)
         if use_cache:
             os.makedirs(cache_dir, exist_ok=True)
@@ -227,7 +289,7 @@ class SpeakerASRModels:
                 cache_path = None
                 if use_cache:
                     base = os.path.splitext(os.path.basename(w))[0]
-                    cache_path = os.path.join(cache_dir, base + '.npy')
+                    cache_path = os.path.join(cache_dir, base + ".npy")
                     if os.path.isfile(cache_path):
                         try:
                             emb = np.load(cache_path)
@@ -270,7 +332,7 @@ class SpeakerASRModels:
             if not self.manager.add(spk, mean_emb):
                 raise RuntimeError(f"Failed to add speaker {spk}")
 
-        save_npz = getattr(self.args, 'save_speaker_embeds', '')
+        save_npz = getattr(self.args, "save_speaker_embeds", "")
         if save_npz:
             try:
                 np.savez_compressed(save_npz, **speaker_means)
@@ -278,6 +340,12 @@ class SpeakerASRModels:
                 pass
 
     def identify(self, samples, sr: int, threshold: float) -> Tuple[str, float]:
+        """对一段语音做说话人识别。
+
+        返回：
+        - pred: 预测说话人 ID（未命中阈值返回 "unknown"）
+        - top1_score: 与最相近注册说话人的余弦相似度
+        """
         samples_np = self._to_numpy_waveform(samples)
         s = self.extractor.create_stream()
         s.accept_waveform(sr, samples_np)
@@ -298,6 +366,7 @@ class SpeakerASRModels:
         return pred, top1_score
 
     def asr_infer(self, samples, sr: int) -> str:
+        """对一段语音做 ASR 推理，返回转写文本。"""
         samples_np = self._to_numpy_waveform(samples)
         st = self.asr.create_stream()
         st.accept_waveform(sr, samples_np)

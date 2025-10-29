@@ -13,7 +13,5 @@ __pycache__/
 segment-algo/test_results/
 test/
 cache/
-todo.txt
-test_overlap/
-test-mossformer/
-test_overlap_eval/
+todo*
+test*/
