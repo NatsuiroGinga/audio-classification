@@ -109,23 +109,4 @@ python3 ./offline_overlap_3src.py \
 - LibriSpeech：作为源语音语料；
 - THCHS30（清华大学中文语音数据集）：http://www.openslr.org/resources/18/data_thchs30.tgz，可用于中文 ASR 训练或快速中文 domain 适配测试。
 
-## 关于计时与对齐（重要提示）
-
-- 核心计算已封装在 `scripts/osd/overlap3_core.py::Overlap3Pipeline`，`offline_overlap_3src.py` 仅负责写文件并将 `Overlap3Pipeline` 的输出落盘；因此 `metrics.json` 中的 `time_compute_total_sec` 与各阶段时间不包含写文件耗时。
-- 若你在输出中发现 `text` 与 `target_src_text` 不一致，最常见原因：
-  1. 混音时对源做了偏移（offset），导致按混音时间直接从 `target_wav` 切片会错位；
-  2. 分离支路残留干扰或分支选择错误（SV 分数偏低）；
-  3. OSD 切分在词边界处分割导致 ASR 差异。
-
-建议：在 refs CSV 中记录 per-source offset 或启用/实现自动对齐（GCC-PHAT 互相关的全局或局部对齐），并根据需要调整 `--sv-threshold` 以减少误选。
-
-## 小贴士与扩展
-
-- 若你的工作聚焦中文语音分离，建议：
-  - 使用 THCHS30 对 ASR 做微调或选择更适合中文的 ASR 模型；
-  - 在文件模式下提供 refs（`--ref-wavs` 或 `--refs-csv`），并在必要时在 CSV 中扩展 `offset` 字段以确保对齐；
-- 若需要将 I/O 时间也计入总体延迟统计，可在调用脚本外部测量并合并到自定义报告中。
-
----
-
 更多细节与高级用法请查看 `scripts/osd` 下的各脚本（`test_overlap_3src.sh`, `offline_overlap_3src.py`, `overlap3_core.py`）
