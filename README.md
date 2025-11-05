@@ -128,6 +128,4 @@ python3 ./offline_overlap_3src.py \
 
 ---
 
-更多细节与高级用法请查看 `scripts/osd` 下的各脚本（`test_overlap_3src.sh`, `offline_overlap_3src.py`, `overlap3_core.py`），如需我把 README 再精简为一页“快速上手指南”，或添加 THCHS30 自动解压示例脚本，我可以继续实现。
-
-- 不再计算 CER（缺乏对应参考转写或实验聚焦于结构管线）。
+更多细节与高级用法请查看 `scripts/osd` 下的各脚本（`test_overlap_3src.sh`, `offline_overlap_3src.py`, `overlap3_core.py`）
