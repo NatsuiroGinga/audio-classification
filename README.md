@@ -91,6 +91,15 @@ python3 ./offline_overlap_3src.py \
 - `--sv-threshold`：目标筛选的余弦阈值，默认 0.6；
 - `--input-wavs` / `--target-wav`：文件模式下直接提供混合与目标音频（便于调试单样例）。
 
+流式识别脚本`streaming_overlap_3src.sh`运行示例：
+
+```bash
+cd scripts/osd
+bash ./streaming_overlap_3src.sh
+```
+
+包装脚本会将默认的 `TARGET_WAV` 转为 `--target-wav` 并调用 `streaming_overlap_3src.py`。
+
 ## 输出与评估指标（面向 3-src）
 
 运行结束后会生成时间戳目录（默认 `test/overlap3/<timestamp>/`），主要文件：
@@ -102,6 +111,16 @@ python3 ./offline_overlap_3src.py \
 - `summary.json`：总体摘要（包含 target hit/miss 统计）。
 
 分离质量评估：支持在文件模式下提供参考源（refs CSV / ref_wavs）进行 SI-SDR/PIT 评估，支持 K=2 或 3 的参考情况。
+
+批量评估:在项目根目录运行 `batch_eval.py` 示例：
+
+```bash
+python3 batch_eval.py \
+  --results-dir test/overlap \
+  --output batch_analysis.json
+```
+
+会自动搜索 overlap 中每次的结果文件夹中的 `metrics.json` 并计算平均值。
 
 ## 数据集（建议 / 常用）
 
