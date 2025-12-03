@@ -17,3 +17,5 @@ soundfile==0.13.1
 torch==2.5.0+cu121
 torchaudio==2.5.0+cu121
 tqdm==4.67.1
+#for streaming
+pyaudio

@@ -1,206 +1,25 @@
 #!/usr/bin/env python3
 """
-Offline OSD + 3-source Separation + ASR (Libri3Mix/LibriMix via torchaudio)
+Offline OSD + 3-source Separation + ASR runner
 
-- Uses torchaudio.datasets.LibriMix with num_speakers=3.
-- Overlap segments are separated into 3 branches using Conv-TasNet (asteroid backend).
-- Target-speaker filtering (REQUIRED): only ASR the branches matching enrolled target speaker.
-- Produces per-segment JSONL and CSV, plus optional metrics JSON.
-
-Notes:
-- Requires Libri3Mix/LibriMix to be generated beforehand (see https://github.com/JorisCos/LibriMix).
-- By default expects 16k (recommended for 3-source HF model), but you can set --sample-rate to 8k if needed.
-- Separator will auto-download 3-source checkpoint when not provided if your project integrates it.
+- 将核心计算逻辑抽取到独立模块 overlap3_core.Overlap3Pipeline
+- 本脚本仅负责参数解析与文件写入（JSONL/CSV/metrics/summary）
+- 计时统计（time_*、rtf_*）均来自核心模块的计算时间，不包含本脚本的文件写入 I/O 时间
 """
 import argparse
-import csv
 import json
-import os
-import random
-import threading
-import time
 from datetime import datetime
 from pathlib import Path
-from statistics import mean
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+import csv
+import sys
 
-import numpy as np
-import torch
+# Make local directory importable to load overlap3_core without requiring a package
+_THIS_DIR = Path(__file__).parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-try:
-    import torchaudio
-    import torchaudio.functional as AF
-    from torchaudio.datasets import LibriMix
-except Exception as _e:  # pragma: no cover
-    torchaudio = None  # type: ignore
-    AF = None  # type: ignore
-    LibriMix = None  # type: ignore
-
-try:
-    import psutil  # type: ignore
-except Exception:  # pragma: no cover
-    psutil = None
-
-# Alias for resample
-try:
-    _RESAMPLE = AF.resample if AF is not None else None  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    _RESAMPLE = None
-
-from src.model import create_asr_model, l2norm, G_SAMPLE_RATE
-from src.osd import OverlapAnalyzer
-from src.osd.separation import Separator
-
-try:
-    import sherpa_onnx  # type: ignore
-except Exception:  # pragma: no cover
-    sherpa_onnx = None  # type: ignore
-
-
-# -------------------------------
-# Separation quality (SI-SDR) utils
-# -------------------------------
-def _si_sdr(reference: np.ndarray, estimation: np.ndarray) -> float:
-    """Scale-Invariant SDR in dB.
-
-    - Zero-mean both signals
-    - Project estimation onto reference
-    - Compute 10*log10(P_signal / P_noise)
-    """
-    if reference.shape != estimation.shape:
-        n = min(reference.shape[-1], estimation.shape[-1])
-        reference = reference[..., :n]
-        estimation = estimation[..., :n]
-    ref = reference.astype(np.float32) - float(np.mean(reference))
-    est = estimation.astype(np.float32) - float(np.mean(estimation))
-    ref_energy = float(np.sum(ref**2)) + 1e-12
-    if ref_energy <= 0:
-        return float("nan")
-    scale = float(np.dot(est, ref)) / ref_energy
-    proj = scale * ref
-    e_noise = est - proj
-    num = float(np.sum(proj**2)) + 1e-12
-    den = float(np.sum(e_noise**2)) + 1e-12
-    return 10.0 * float(np.log10(num / den))
-
-
-def _pit_best_si_sdr_k(
-    refs: List[np.ndarray], preds: List[np.ndarray]
-) -> Tuple[float, List[int]]:
-    """PIT for K references (K=2 or 3) vs N predictions.
-
-    Returns best_mean_sdr and assigned pred indices of length K.
-    """
-    K = len(refs)
-    if K not in (2, 3):
-        raise ValueError("_pit_best_si_sdr_k supports K=2 or 3")
-    if len(preds) < K:
-        return float("nan"), []
-
-    # Precompute SDR matrix (K x N)
-    sdr_mat = [[_si_sdr(refs[i], p) for p in preds] for i in range(K)]
-
-    import itertools
-
-    N = len(preds)
-    best = -1e9
-    best_idx: List[int] = []
-    for cols in itertools.combinations(range(N), K):
-        # For chosen columns, check all permutations to assign K refs
-        for perm in itertools.permutations(range(K), K):
-            s = 0.0
-            valid = True
-            for r_i, c_i in enumerate(cols):
-                sdr_val = sdr_mat[perm[r_i]][c_i]
-                if np.isnan(sdr_val):
-                    valid = False
-                    break
-                s += sdr_val
-            if not valid:
-                continue
-            mean_sdr = s / float(K)
-            if mean_sdr > best:
-                best = mean_sdr
-                # Map refs order (0..K-1) to selected pred indices
-                assigned = [cols[perm.index(i)] for i in range(K)]
-                best_idx = list(assigned)
-    if best_idx == []:
-        return float("nan"), []
-    return float(best), best_idx
-
-
-def _compute_sdr_improvement_pit_k(
-    mix_chunk: np.ndarray, refs: List[np.ndarray], preds: List[np.ndarray]
-) -> Tuple[float, float, List[int]]:
-    """Compute PIT-best SI-SDR and SI-SDRi for K refs (2 or 3).
-
-    - base: mean of SI-SDR(mix_chunk, ref_i)
-    - best: PIT-best mean SI-SDR(refs, preds)
-    Returns (best, best - base, assigned_indices)
-    """
-    if len(refs) not in (2, 3):
-        return float("nan"), float("nan"), []
-    base_vals = []
-    for r in refs:
-        base_vals.append(_si_sdr(r, mix_chunk))
-    if any(np.isnan(x) for x in base_vals):
-        return float("nan"), float("nan"), []
-    base = float(np.mean(base_vals))
-    best, indices = _pit_best_si_sdr_k(refs, preds)
-    if np.isnan(best):
-        return float("nan"), float("nan"), []
-    return float(best), float(best - base), indices
-
-
-def _log(msg: str):
-    print(f"[3src] {msg}")
-
-
-def _provider_to_torch_device(provider: str) -> str:
-    p = (provider or "").lower()
-    if "cuda" in p or "gpu" in p:
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    return "cpu"
-
-
-def _to_mono_float(wav: torch.Tensor) -> torch.Tensor:
-    # Accept (T,) or (C, T); convert to mono float32 (T,)
-    if wav.dim() == 2:
-        if wav.size(0) > 1:
-            wav = wav.mean(dim=0)
-        else:
-            wav = wav[0]
-    return wav.float().contiguous()
-
-
-def _ensure_sr_np(wav: torch.Tensor, sr: int, target_sr: int) -> Tuple[np.ndarray, int]:
-    wav = _to_mono_float(wav)
-    if sr != target_sr and wav.numel() > 1:
-        if _RESAMPLE is None:
-            raise RuntimeError("torchaudio.functional.resample is unavailable")
-        wav = _RESAMPLE(wav.unsqueeze(0), sr, target_sr).squeeze(0)
-        sr = target_sr
-    return wav.cpu().numpy(), sr
-
-
-def _build_asr(args):
-    return create_asr_model(
-        paraformer=getattr(args, "paraformer", ""),
-        sense_voice=getattr(args, "sense_voice", ""),
-        encoder=getattr(args, "encoder", ""),
-        decoder=getattr(args, "decoder", ""),
-        joiner=getattr(args, "joiner", ""),
-        tokens=getattr(args, "tokens", ""),
-        num_threads=args.num_threads,
-        feature_dim=getattr(args, "feature_dim", 80),
-        decoding_method=getattr(args, "decoding_method", "greedy_search"),
-        debug=getattr(args, "debug", False),
-        language=getattr(args, "language", "auto"),
-        provider=args.provider,
-    )
+from overlap3_core import Overlap3Pipeline
 
 
 def parse_args():
@@ -230,6 +49,29 @@ def parse_args():
         type=int,
         default=-1,
         help="Random seed for reproducibility (>=0 to enable)",
+    )
+    # File-mode (bypass LibriMix) — process arbitrary mixture WAV(s)
+    p.add_argument(
+        "--input-wavs",
+        nargs="+",
+        default=None,
+        help="Process given mixture WAV files directly (bypasses LibriMix). If set, --target-wav is required.",
+    )
+    p.add_argument(
+        "--target-wav",
+        default="",
+        help="Enrollment audio WAV for the target speaker (REQUIRED in file mode).",
+    )
+    p.add_argument(
+        "--refs-csv",
+        default="",
+        help="In file mode: CSV mapping mixture to reference sources with columns: mix,ref1,ref2[,ref3]. Enables separation quality evaluation.",
+    )
+    p.add_argument(
+        "--ref-wavs",
+        nargs="+",
+        default=None,
+        help="In file mode: reference source WAVs (2 or 3) when only a single mixture is provided. Enables separation quality evaluation.",
     )
 
     # OSD
@@ -273,6 +115,21 @@ def parse_args():
     # Overlap handling
     p.add_argument("--min-overlap-dur", type=float, default=0.4)
 
+    # Segment post-processing: make clean segments the complement of overlap (exclusive)
+    p.add_argument(
+        "--exclusive-segments",
+        dest="exclusive_segments",
+        action="store_true",
+        help="Make clean segments the complement of merged overlap segments; ensures no time overlap between clean and overlap.",
+    )
+    p.add_argument(
+        "--no-exclusive-segments",
+        dest="exclusive_segments",
+        action="store_false",
+        help="Use raw window-expanded OSD labels; clean and overlap windows may overlap in time at boundaries.",
+    )
+    p.set_defaults(exclusive_segments=True)
+
     # Output / metrics
     p.add_argument("--out-dir", default="test/overlap3")
     p.add_argument("--enable-metrics", action="store_true")
@@ -299,83 +156,20 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if torchaudio is None or LibriMix is None:
-        raise RuntimeError(
-            "torchaudio and torchaudio.datasets.LibriMix are required. Please install torchaudio matching your torch version."
-        )
-
-    # Set random seed for reproducibility if provided
-    try:
-        if getattr(args, "seed", -1) is not None and int(args.seed) >= 0:
-            random.seed(int(args.seed))
-            np.random.seed(int(args.seed))
-            try:
-                torch.manual_seed(int(args.seed))
-            except Exception:
-                pass
-    except Exception:
-        pass
 
     base_out_dir = Path(args.out_dir)
     base_out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     out_dir = base_out_dir / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Run compute-only pipeline
+    pipeline = Overlap3Pipeline(args)
+    result = pipeline.run()
 
-    torch_device = _provider_to_torch_device(args.provider)
-
-    # Build components
-    asr = _build_asr(args)
-    osd = OverlapAnalyzer(
-        threshold=args.osd_thr,
-        win_sec=args.osd_win,
-        hop_sec=args.osd_hop,
-        backend=args.osd_backend or "pyannote",
-        device=torch_device,
-    )
-    sep = Separator(
-        backend=args.sep_backend or "asteroid",
-        checkpoint=(args.sep_checkpoint or None),
-        device=torch_device,
-        n_src=3,
-    )
-
-    # Build speaker embedding extractor (required)
-    if sherpa_onnx is None:
-        raise RuntimeError(
-            "sherpa_onnx is required for speaker embedding. Please install sherpa_onnx."
-        )
-    se_config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-        model=args.spk_embed_model,
-        num_threads=args.num_threads,
-        debug=getattr(args, "debug", False),
-        provider=args.provider,
-    )
-    if not se_config.validate():
-        raise ValueError(f"Invalid speaker embedding config: {se_config}")
-    extractor = sherpa_onnx.SpeakerEmbeddingExtractor(se_config)
-    manager: Any = None
-    enrolled_vec_norm = None
-
-    # Dataset
-    ds = LibriMix(
-        root=args.librimix_root,
-        subset=args.subset,
-        num_speakers=3,
-        sample_rate=args.sample_rate,
-        task=args.task,
-        mode=args.mode,
-    )
-    total = len(ds)
-    limit = args.max_files if args.max_files and args.max_files > 0 else total
-    _log(
-        f"Loaded LibriMix subset={args.subset} num_speakers=3 sr={args.sample_rate} size={total}, processing={limit}"
-    )
-
-    # Outputs
-    seg_jsonl = (out_dir / "segments.jsonl").open("w", encoding="utf-8")
-    pred_csv = (out_dir / "segments.csv").open("w", newline="", encoding="utf-8")
-    csv_writer = csv.writer(pred_csv)
+    # Write per-segment outputs (I/O time is intentionally outside the pipeline)
+    seg_jsonl_f = (out_dir / "segments.jsonl").open("w", encoding="utf-8")
+    seg_csv_f = (out_dir / "segments.csv").open("w", newline="", encoding="utf-8")
+    csv_writer = csv.writer(seg_csv_f)
     csv_writer.writerow(
         [
             "wav",
@@ -390,547 +184,77 @@ def main():
             "target_src_text",
         ]
     )
-
-    n_segments = 0
-    n_clean_segments = 0
-    n_overlap_segments = 0
-    n_separated_streams = 0
-    n_matched_segments = 0
-    # Target hit/miss accounting
-    n_seen_clean_segments = 0
-    n_seen_overlap_segments = 0
-    n_missed_segments = 0
-    n_missed_clean_segments = 0
-    n_missed_overlap_segments = 0
-    total_audio_sec = 0.0
-    total_overlap_audio_sec = 0.0
-    total_clean_audio_sec = 0.0
-    total_matched_audio_sec = 0.0
-    total_seen_clean_audio_sec = 0.0
-    total_seen_overlap_audio_sec = 0.0
-    total_missed_audio_sec = 0.0
-    time_osd = 0.0
-    time_sep = 0.0
-    time_asr = 0.0
-
-    # Separation evaluation accumulators (K=3)
-    sep_eval_enabled = getattr(args, "eval_separation", False)
-    sep_sisdr_list: List[float] = []
-    sep_sisdri_list: List[float] = []
-    sep_details_writer = None
-    sep_details_fh = None
-    if sep_eval_enabled and getattr(args, "save_sep_details", False):
-        sep_details_fh = (out_dir / args.sep_details_out).open(
-            "w", newline="", encoding="utf-8"
-        )
-        sep_details_writer = csv.writer(sep_details_fh)
-        sep_details_writer.writerow(
+    for rec in result.segments:
+        # JSONL
+        seg_jsonl_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # CSV row
+        csv_writer.writerow(
             [
-                "wav",
-                "start",
-                "end",
-                "k_refs",
-                "sisdr",
-                "sisdri",
-                "selected_pred_indices",
+                rec.get("wav", ""),
+                f"{rec.get('start', 0):.3f}",
+                f"{rec.get('end', 0):.3f}",
+                rec.get("kind", ""),
+                (rec.get("stream") if rec.get("stream") is not None else ""),
+                rec.get("text", ""),
+                f"{rec.get('asr_time', 0):.3f}",
+                (rec.get("sv_score") if rec.get("sv_score") is not None else ""),
+                rec.get("target_src", "") or "",
+                rec.get("target_src_text", ""),
             ]
         )
+    seg_jsonl_f.close()
+    seg_csv_f.close()
 
-    class _ResourceMonitor:
-        def __init__(self, interval: float):
-            self.interval = max(0.1, interval)
-            self.samples: List[dict] = []
-            self._stop = threading.Event()
-            self._thread: Optional[threading.Thread] = None
-            self._proc = psutil.Process(os.getpid()) if psutil else None
-
-        def _gpu_info(self):
-            if torch.cuda.is_available():
-                try:
-                    return {
-                        "gpu_mem_allocated": torch.cuda.memory_allocated() / (1024**2),
-                        "gpu_mem_reserved": torch.cuda.memory_reserved() / (1024**2),
-                        "gpu_max_mem_allocated": torch.cuda.max_memory_allocated()
-                        / (1024**2),
-                    }
-                except Exception:
-                    return {}
-            return {}
-
-        def _loop(self):
-            if self._proc:
-                self._proc.cpu_percent(interval=None)
-            while not self._stop.wait(self.interval):
-                if not self._proc:
-                    break
-                try:
-                    cpu = self._proc.cpu_percent(interval=None)
-                    mem_info = self._proc.memory_info()
-                    rss_mb = mem_info.rss / (1024**2)
-                    rec = {"cpu": cpu, "rss_mb": rss_mb}
-                    rec.update(self._gpu_info())
-                    self.samples.append(rec)
-                except Exception:
-                    break
-
-        def start(self):
-            if self._proc is None:
-                return
-            self._thread = threading.Thread(target=self._loop, daemon=True)
-            self._thread.start()
-
-        def stop(self):
-            if self._proc is None:
-                return
-            self._stop.set()
-            if self._thread:
-                self._thread.join(timeout=2)
-
-        def aggregate(self):
-            if not self.samples:
-                return {}
-            cpu_list = [s["cpu"] for s in self.samples if "cpu" in s]
-            rss_list = [s["rss_mb"] for s in self.samples if "rss_mb" in s]
-            gpu_alloc = [s.get("gpu_mem_allocated", 0.0) for s in self.samples]
-            gpu_res = [s.get("gpu_mem_reserved", 0.0) for s in self.samples]
-            return {
-                "cpu_avg": round(mean(cpu_list), 2) if cpu_list else None,
-                "cpu_peak": round(max(cpu_list), 2) if cpu_list else None,
-                "rss_avg_mb": round(mean(rss_list), 2) if rss_list else None,
-                "rss_peak_mb": round(max(rss_list), 2) if rss_list else None,
-                "gpu_mem_allocated_avg_mb": (
-                    round(mean(gpu_alloc), 2) if gpu_alloc else None
-                ),
-                "gpu_mem_allocated_peak_mb": (
-                    round(max(gpu_alloc), 2) if gpu_alloc else None
-                ),
-                "gpu_mem_reserved_peak_mb": round(max(gpu_res), 2) if gpu_res else None,
-            }
-
-    monitor = None
-    if args.enable_metrics:
-        if psutil is None:
-            _log("psutil not installed; resource monitoring disabled.")
-        else:
-            monitor = _ResourceMonitor(args.monitor_interval)
-            monitor.start()
-
-    t0_all = time.time()
-
-    for idx in range(limit):
-        sr_item, mix_wav, _sources = ds[idx]
-        # Optional: file path via metadata
-        try:
-            _sr_meta, mix_path, _src_paths = ds.get_metadata(idx)
-            src_paths = list(_src_paths) if _src_paths is not None else []
-        except Exception:
-            mix_path = f"index:{idx}"
-            src_paths = []
-
-        # Resolve absolute path for outputs when available; keep index:* as-is
-        def _resolve_mix_path(root: str, p: str) -> str:
-            try:
-                if isinstance(p, str) and (
-                    p.startswith("index:") or Path(p).is_absolute()
-                ):
-                    return p
-                return str(Path(root) / p)
-            except Exception:
-                return p
-
-        abs_mix_path = _resolve_mix_path(str(ds.root), mix_path)
-
-        # OSD on mixture at dataset SR
-        mix_np, sr = _ensure_sr_np(mix_wav, sr_item, G_SAMPLE_RATE)
-        dur = len(mix_np) / sr
-        total_audio_sec += dur
-
-        t_osd0 = time.time()
-        segs = osd.analyze(mix_np, sr)
-        time_osd += time.time() - t_osd0
-        if not segs:
-            segs = [(0.0, dur, False)]
-
-        # Select a random source from this mixture as target enrollment
-        target_src_idx = 0
-        target_src_abs = None
-        target_src_text = ""
-        try:
-            if _sources and len(_sources) > 0:
-                target_src_idx = random.randrange(len(_sources))
-            # Join absolute path for CSV marking
-            if src_paths and len(src_paths) > target_src_idx:
-                target_src_abs = str(Path(ds.root) / src_paths[target_src_idx])
-            # Build Manager per mixture with chosen target embedding
-            manager = sherpa_onnx.SpeakerEmbeddingManager(extractor.dim)
-
-            def _compute_emb(wav_np: np.ndarray, sr: int) -> np.ndarray:
-                s = extractor.create_stream()
-                s.accept_waveform(sr, wav_np)
-                s.input_finished()
-                assert extractor.is_ready(s)
-                emb = np.array(extractor.compute(s), dtype=np.float32)
-                return l2norm(emb)
-
-            # Compute target embedding from the full chosen source audio
-            src_wav_t = _sources[target_src_idx]
-            src_np_t, _ = _ensure_sr_np(src_wav_t, sr_item, G_SAMPLE_RATE)
-            enrolled_vec = _compute_emb(src_np_t, G_SAMPLE_RATE)
-            enrolled_vec_norm = l2norm(enrolled_vec)
-            _ = manager.add("target", enrolled_vec)
-            _log(
-                f"Selected target source idx={target_src_idx} path={target_src_abs if target_src_abs else 'N/A'}"
+    # Optional: write separation details CSV
+    if getattr(args, "eval_separation", False) and getattr(
+        args, "save_sep_details", False
+    ):
+        with (out_dir / args.sep_details_out).open(
+            "w", newline="", encoding="utf-8"
+        ) as fh:
+            w = csv.writer(fh)
+            w.writerow(
+                [
+                    "wav",
+                    "start",
+                    "end",
+                    "k_refs",
+                    "sisdr",
+                    "sisdri",
+                    "selected_pred_indices",
+                ]
             )
-            # Compute ASR on the selected target source (once per mixture)
-            try:
-                st_tgt = asr.create_stream()
-                st_tgt.accept_waveform(G_SAMPLE_RATE, src_np_t)
-                asr.decode_stream(st_tgt)
-                target_src_text = st_tgt.result.text or ""
-            except Exception as _e:
-                _log(f"ASR on target_src failed: {_e}")
-        except Exception as _e:
-            _log(f"Failed to prepare target enrollment from sources: {_e}")
-            enrolled_vec_norm = None
-            manager = None
+            for row in result.sep_details_rows:
+                w.writerow(row)
 
-        for s, e, is_olap in segs:
-            if e - s <= 0:
-                continue
-            s_i = int(s * sr)
-            e_i = int(e * sr)
-            chunk = mix_np[s_i:e_i]
-
-            if (not is_olap) or (e - s) < args.min_overlap_dur:
-                sv_score = None
-                matched = True
-                seg_dur = e - s
-                # accounting for seen clean segments
-                n_seen_clean_segments += 1
-                total_seen_clean_audio_sec += seg_dur
-                if extractor is not None and enrolled_vec_norm is not None:
-                    sstream = extractor.create_stream()
-                    sstream.accept_waveform(sr, chunk)
-                    sstream.input_finished()
-                    if extractor.is_ready(sstream):
-                        emb = np.array(extractor.compute(sstream), dtype=np.float32)
-                        emb = l2norm(emb)
-                        sv_score = float(np.dot(emb, enrolled_vec_norm))
-                        # Gate by Manager label match if available
-                        if manager is not None:
-                            pred = manager.search(emb, threshold=args.sv_threshold)
-                            matched = pred == "target"
-                        else:
-                            matched = sv_score >= args.sv_threshold
-                    else:
-                        matched = False
-                if not matched:
-                    n_missed_segments += 1
-                    n_missed_clean_segments += 1
-                    total_missed_audio_sec += seg_dur
-                    continue
-                asr_t0 = time.time()
-                st = asr.create_stream()
-                st.accept_waveform(sr, chunk)
-                asr.decode_stream(st)
-                text = st.result.text
-                asr_t1 = time.time()
-                rec = {
-                    "wav": abs_mix_path,
-                    "start": round(s, 3),
-                    "end": round(e, 3),
-                    "kind": "clean",
-                    "stream": None,
-                    "text": text,
-                    "asr_time": round(asr_t1 - asr_t0, 3),
-                    "sv_score": (round(sv_score, 4) if sv_score is not None else None),
-                    "target_src": target_src_abs,
-                    "target_src_text": target_src_text,
-                }
-                seg_jsonl.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                csv_writer.writerow(
-                    [
-                        abs_mix_path,
-                        f"{s:.3f}",
-                        f"{e:.3f}",
-                        "clean",
-                        "",
-                        text,
-                        f"{(asr_t1 - asr_t0):.3f}",
-                        f"{rec['sv_score'] if rec['sv_score'] is not None else ''}",
-                        target_src_abs if target_src_abs else "",
-                        target_src_text,
-                    ]
-                )
-                n_segments += 1
-                n_clean_segments += 1
-                n_matched_segments += 1
-                total_clean_audio_sec += e - s
-                total_matched_audio_sec += e - s
-                time_asr += asr_t1 - asr_t0
-            else:
-                # Overlap → separate 3 branches then ASR
-                t_sep0 = time.time()
-                pred_wavs = sep.separate(chunk, sr)
-                time_sep += time.time() - t_sep0
-                branches = list(pred_wavs)
-                # accounting for seen overlap segments
-                seg_dur = e - s
-                n_seen_overlap_segments += 1
-                total_seen_overlap_audio_sec += seg_dur
-                total_overlap_audio_sec += seg_dur
-
-                # Separation quality evaluation (K=3) using LibriMix source references
-                if sep_eval_enabled and src_paths and len(branches) >= 3:
-                    refs: List[np.ndarray] = []
-                    try:
-                        for sp in src_paths[:3]:  # expect 3 sources
-                            abs_p = str(Path(ds.root) / sp)
-                            sw, ssr = torchaudio.load(abs_p)
-                            snp, _ = _ensure_sr_np(sw, ssr, sr)
-                            # slice to segment
-                            s_i_ref = int(s * sr)
-                            e_i_ref = int(e * sr)
-                            refs.append(snp[s_i_ref:e_i_ref])
-                        # preds are branches already sliced chunk-wise
-                        preds_np = [np.asarray(b, dtype=np.float32) for b in branches]
-                        best, sdri, idx_sel = _compute_sdr_improvement_pit_k(
-                            chunk, refs, preds_np
-                        )
-                        if not (np.isnan(best) or np.isnan(sdri)):
-                            sep_sisdr_list.append(float(best))
-                            sep_sisdri_list.append(float(sdri))
-                            if sep_details_writer is not None:
-                                sep_details_writer.writerow(
-                                    [
-                                        mix_path,
-                                        f"{s:.3f}",
-                                        f"{e:.3f}",
-                                        3,
-                                        f"{best:.4f}",
-                                        f"{sdri:.4f}",
-                                        ";".join(str(i) for i in idx_sel),
-                                    ]
-                                )
-                    except Exception as _e:
-                        _log(
-                            f"Separation eval failed for {mix_path} [{s:.3f},{e:.3f}]: {_e}"
-                        )
-
-                if extractor is not None and enrolled_vec_norm is not None:
-                    scores: List[float] = []
-                    preds: List[str] = []
-                    for w in branches:
-                        sstream = extractor.create_stream()
-                        sstream.accept_waveform(sr, w)
-                        sstream.input_finished()
-                        if extractor.is_ready(sstream):
-                            emb = np.array(extractor.compute(sstream), dtype=np.float32)
-                            emb = l2norm(emb)
-                            score = float(np.dot(emb, enrolled_vec_norm))
-                            scores.append(score)
-                            if manager is not None:
-                                pred = manager.search(emb, threshold=args.sv_threshold)
-                            else:
-                                pred = (
-                                    "target"
-                                    if score >= args.sv_threshold
-                                    else "unknown"
-                                )
-                            preds.append(pred)
-                        else:
-                            scores.append(-1.0)
-                            preds.append("unknown")
-                    # Pick best by cosine score, then require manager match 'target'
-                    best_idx = int(np.argmax(scores)) if scores else 0
-                    best_score = scores[best_idx] if scores else -1.0
-                    if best_score < args.sv_threshold or (
-                        manager is not None and preds[best_idx] != "target"
-                    ):
-                        # no branch matches target sufficiently
-                        n_missed_segments += 1
-                        n_missed_overlap_segments += 1
-                        total_missed_audio_sec += seg_dur
-                        continue
-                    selected = [(best_idx, branches[best_idx], best_score)]
-                else:
-                    # Filtering is required; without embeddings we cannot match target
-                    # Mark as miss for this segment and skip
-                    n_missed_segments += 1
-                    n_missed_overlap_segments += 1
-                    total_missed_audio_sec += seg_dur
-                    continue
-
-                for k, w, score in selected:
-                    sv_score = float(score) if score is not None else None
-                    matched = True
-                    asr_t0 = time.time()
-                    st = asr.create_stream()
-                    st.accept_waveform(sr, w)
-                    asr.decode_stream(st)
-                    text = st.result.text
-                    asr_t1 = time.time()
-                    rec = {
-                        "wav": abs_mix_path,
-                        "start": round(s, 3),
-                        "end": round(e, 3),
-                        "kind": "overlap",
-                        "stream": int(k),
-                        "text": text,
-                        "asr_time": round(asr_t1 - asr_t0, 3),
-                        "sv_score": (
-                            round(sv_score, 4) if sv_score is not None else None
-                        ),
-                        "target_src": target_src_abs,
-                        "target_src_text": target_src_text,
-                    }
-                    seg_jsonl.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    csv_writer.writerow(
-                        [
-                            abs_mix_path,
-                            f"{s:.3f}",
-                            f"{e:.3f}",
-                            "overlap",
-                            int(k),
-                            text,
-                            f"{(asr_t1 - asr_t0):.3f}",
-                            f"{rec['sv_score'] if rec['sv_score'] is not None else ''}",
-                            target_src_abs if target_src_abs else "",
-                            target_src_text,
-                        ]
-                    )
-                    n_segments += 1
-                    n_overlap_segments += 1
-                    n_separated_streams += 1
-                    n_matched_segments += 1
-                    total_matched_audio_sec += e - s
-                    time_asr += asr_t1 - asr_t0
-
-    # Close outputs
-    seg_jsonl.close()
-    pred_csv.close()
-    if sep_eval_enabled and sep_details_fh is not None:
-        try:
-            sep_details_fh.close()
-        except Exception:
-            pass
-
-    # Total elapsed wall-clock time
-    elapsed_total = time.time() - t0_all
-    # monitor stop and aggregate
-    if args.enable_metrics and psutil is not None:
-        try:
-            monitor.stop()  # type: ignore[union-attr]
-            resource_stats = monitor.aggregate()  # type: ignore[union-attr]
-        except Exception:
-            resource_stats = {}
-    else:
-        resource_stats = {}
-
-    # Derive metrics
-    rtf_total = elapsed_total / total_audio_sec if total_audio_sec > 0 else None
-    rtf_asr = time_asr / total_audio_sec if total_audio_sec > 0 else None
-
-    def _maybe_round(x, nd=4):
-        if x is None:
-            return None
-        try:
-            return round(x, nd)
-        except Exception:
-            return None
-
-    def _agg(vals: List[float]) -> Dict[str, Optional[float]]:
-        if not vals:
-            return {"mean": None, "median": None, "std": None, "count": 0}
-        arr = np.asarray(vals, dtype=np.float32)
-        return {
-            "mean": round(float(np.mean(arr)), 4),
-            "median": round(float(np.median(arr)), 4),
-            "std": round(float(np.std(arr)), 4),
-            "count": int(arr.size),
-        }
-
-    metrics: Dict[str, Any] = {
-        "total_audio_sec": round(total_audio_sec, 3),
-        "audio_overlap_sec": round(total_overlap_audio_sec, 3),
-        "audio_clean_sec": round(total_clean_audio_sec, 3),
-        "audio_matched_sec": round(total_matched_audio_sec, 3),
-        "audio_seen_clean_sec": round(total_seen_clean_audio_sec, 3),
-        "audio_seen_overlap_sec": round(total_seen_overlap_audio_sec, 3),
-        "audio_missed_sec": round(total_missed_audio_sec, 3),
-        "segments_total": n_segments,
-        "segments_clean": n_clean_segments,
-        "segments_overlap_streams": n_overlap_segments,
-        "separated_streams": n_separated_streams,
-        "segments_matched": n_matched_segments,
-        "segments_seen_clean": n_seen_clean_segments,
-        "segments_seen_overlap": n_seen_overlap_segments,
-        "segments_missed": n_missed_segments,
-        "segments_missed_clean": n_missed_clean_segments,
-        "segments_missed_overlap": n_missed_overlap_segments,
-        "target_hit_rate_segments": (
-            round(
-                (
-                    n_matched_segments
-                    / (n_seen_clean_segments + n_seen_overlap_segments)
-                ),
-                4,
-            )
-            if (n_seen_clean_segments + n_seen_overlap_segments) > 0
-            else None
-        ),
-        "time_osd_sec": round(time_osd, 3),
-        "time_sep_sec": round(time_sep, 3),
-        "time_asr_sec": round(time_asr, 3),
-        "rtf_total": _maybe_round(rtf_total, 4),
-        "rtf_asr": _maybe_round(rtf_asr, 4),
-    }
-    # Attach separation evaluation aggregates if enabled
-    if sep_eval_enabled:
-        sisdr_stats = _agg(sep_sisdr_list)
-        sisdri_stats = _agg(sep_sisdri_list)
-        metrics.update(
-            {
-                "sep_eval_k_refs": 3,
-                "sep_eval_segments": sisdr_stats["count"],
-                "sep_sisdr_mean": sisdr_stats["mean"],
-                "sep_sisdr_median": sisdr_stats["median"],
-                "sep_sisdr_std": sisdr_stats["std"],
-                "sep_sisdri_mean": sisdri_stats["mean"],
-                "sep_sisdri_median": sisdri_stats["median"],
-                "sep_sisdri_std": sisdri_stats["std"],
-            }
-        )
-    metrics.update(resource_stats)
-
-    summary = {
-        "segments": n_segments,
-        "dataset": "LibriMix",
-        "subset": args.subset,
+    # Compose and write metrics/summary (metrics are compute-only)
+    metrics: Any = result.metrics
+    summary: Any = {
+        "segments": metrics.get("segments_total"),
+        "dataset": result.dataset_name,
+        "subset": result.subset,
         "num_speakers": 3,
-        "sample_rate": args.sample_rate,
-        "processed_mixtures": limit,
+        "sample_rate": result.sample_rate,
+        "processed_mixtures": result.processed_mixtures,
         "notes": "ASR only; overlap segments separated into 3 branches; no CER.",
+        # Target hit/miss summary for convenience
+        "target_hits_segments": metrics.get("segments_matched"),
+        "target_misses_segments": metrics.get("segments_missed"),
+        "target_hits_clean_segments": metrics.get("segments_clean"),
+        "target_misses_clean_segments": metrics.get("segments_missed_clean"),
+        "target_hits_overlap_segments": metrics.get("segments_overlap_streams"),
+        "target_misses_overlap_segments": metrics.get("segments_missed_overlap"),
     }
-    # always include target hit/miss summary
-    summary.update(
-        {
-            "target_hits_segments": n_matched_segments,
-            "target_misses_segments": n_missed_segments,
-            "target_hits_clean_segments": n_clean_segments,
-            "target_misses_clean_segments": n_missed_clean_segments,
-            "target_hits_overlap_segments": n_overlap_segments,
-            "target_misses_overlap_segments": n_missed_overlap_segments,
-        }
-    )
-    if args.enable_metrics:
+    if getattr(args, "enable_metrics", False):
         with (out_dir / args.metrics_out).open("w", encoding="utf-8") as mf:
             json.dump(metrics, mf, ensure_ascii=False, indent=2)
-        summary["metrics"] = metrics  # type: ignore[index]
+        summary["metrics"] = metrics
     with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print(f"Done. segments={n_segments}, mixtures={limit}, out_dir={out_dir}")
+    print(
+        f"Done. segments={metrics.get('segments_total')}, mixtures={result.processed_mixtures}, out_dir={out_dir}"
+    )
 
 
 if __name__ == "__main__":
