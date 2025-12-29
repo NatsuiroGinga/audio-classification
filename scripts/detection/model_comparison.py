@@ -304,6 +304,7 @@ def run_model_test(
     num_cores: int = 1,
     streaming_config: Optional[StreamingConfig] = None,
     keyword: str = KEYWORD_NIHAO_ZHENZHEN,
+    keywords_threshold: float = 0.25,
 ) -> TestResult:
     """运行单个模型配置的测试（流式模式）。"""
 
@@ -327,7 +328,17 @@ def run_model_test(
 
     # 创建模型
     try:
-        kws_model = create_model_with_config(config, keyword)
+        # 使用指定的阈值创建模型
+        kws_model = create_kws_model(
+            config.model_dir,
+            keywords=keyword,
+            use_int8=config.use_int8,
+            epoch=config.epoch,
+            avg=config.avg,
+            chunk=config.chunk,
+            left=config.left,
+            keywords_threshold=keywords_threshold,
+        )
     except Exception as e:
         print(f"  模型创建失败: {e}")
         return result
@@ -439,6 +450,18 @@ def main():
         action="store_true",
         help="不模拟实时延迟（仅测试检测逻辑）",
     )
+    parser.add_argument(
+        "--keywords-threshold",
+        type=float,
+        default=0.25,
+        help="全局唤醒阈值（越大越难触发）",
+    )
+    parser.add_argument(
+        "--per-word-threshold",
+        type=float,
+        default=None,
+        help="逐词阈值（仅对目标关键词生效），例如 0.40",
+    )
 
     args = parser.parse_args()
 
@@ -480,6 +503,9 @@ def main():
     print(f"正常负样本: {len(negative_normal)}")
     print(f"谐音负样本: {len(negative_homophone)}")
     print(f"psutil 可用: {PSUTIL_AVAILABLE}")
+    print(f"全局阈值: {args.keywords_threshold}")
+    if args.per_word_threshold is not None:
+        print(f"逐词阈值: {args.per_word_threshold}（针对 你好真真）")
     print()
 
     # 定义测试配置
@@ -524,6 +550,17 @@ def main():
 
     results: List[TestResult] = []
 
+    # 构造关键词字符串（逐词阈值：在关键词行加入 #threshold）
+    keyword_line = KEYWORD_NIHAO_ZHENZHEN
+    if args.per_word_threshold is not None:
+        # 将 '@' 前插入 '#阈值'
+        # 例如: "... zh ēn zh ēn #0.40 @你好真真"
+        parts = keyword_line.split("@")
+        if len(parts) == 2:
+            keyword_line = (
+                parts[0].strip() + f" #{args.per_word_threshold} @" + parts[1].strip()
+            )
+
     for config in test_configs:
         quant_str = "int8" if config.use_int8 else "fp32"
         print(f"测试: {config.model_name} ({quant_str})...")
@@ -540,6 +577,8 @@ def main():
             negative_homophone_samples=negative_homophone,
             num_cores=num_cores,
             streaming_config=streaming_config,
+            keyword=keyword_line,
+            keywords_threshold=args.keywords_threshold,
         )
         results.append(result)
 
