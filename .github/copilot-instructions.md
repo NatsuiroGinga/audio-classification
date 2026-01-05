@@ -56,11 +56,13 @@ This is an **audio classification & speech processing pipeline** project with fo
 ### ASR Integration
 
 Three ASR backends via `create_asr_model()`:
+
 - Paraformer (single-model, fastest)
 - SenseVoice (multilingual via Sherpa-ONNX)
 - Transducer (Encoder-Decoder-Joiner, streaming-capable)
 
 **Streaming ASR** (`StreamingASRPipeline`):
+
 - Outputs **Partial results** during recognition (intermediate, may change)
 - Outputs **Final results** when VAD detects sentence end (stable)
 - Only VAD-based segmentation (no max duration forcing)
@@ -71,11 +73,13 @@ Use `--provider cuda|cpu|coreml` to control inference hardware.
 ### Output Formats
 
 **3-Source Pipeline** (`offline_overlap_3src.py`):
+
 - `segments.jsonl`: Per-segment results (start, end, kind, stream, text, sv_score)
 - `segments.csv`: Same data, tabular format
 - `summary.json`: Aggregated metrics (detection rate, separation quality, RTF)
 
 **Benchmark Pipeline**:
+
 - `detail.jsonl`: Per-utterance records (speaker, score, text, timings, RTF)
 - `predictions.csv`: CSV version with additional CPU/GPU metrics
 - `summary.json`: Accuracy, enrollment speakers, average timings
@@ -83,6 +87,7 @@ Use `--provider cuda|cpu|coreml` to control inference hardware.
 ## Developer Workflows
 
 ### Installation
+
 ```bash
 cd scripts
 bash install.sh          # CPU by default
@@ -90,6 +95,7 @@ CPU=1 bash install.sh    # Force CPU-only
 ```
 
 ### Running 3-Source Pipeline (File Mode)
+
 ```bash
 cd scripts/osd
 python offline_overlap_3src.py \
@@ -102,6 +108,7 @@ python offline_overlap_3src.py \
 ```
 
 ### Running with LibriMix Dataset
+
 ```bash
 python offline_overlap_3src.py \
   --librimix-root /path/to/LibriMix \
@@ -111,6 +118,7 @@ python offline_overlap_3src.py \
 ```
 
 ### Benchmarking Speaker ID + ASR
+
 ```bash
 python benchmark_pipeline.py \
   --speaker-file speaker_list.txt \
@@ -121,6 +129,7 @@ python benchmark_pipeline.py \
 ```
 
 ### Running Streaming ASR Demo
+
 ```bash
 cd scripts
 bash demo_streaming_asr.sh s1 0.3 0.5
@@ -128,6 +137,7 @@ bash demo_streaming_asr.sh s1 0.3 0.5
 ```
 
 ### Running VAD-based Streaming Demo
+
 ```bash
 cd demo_video
 bash demo_streaming.sh s1 2.0 0.4 --vad
@@ -136,14 +146,14 @@ bash demo_streaming.sh s1 2.0 0.4 --vad
 
 ## External Dependencies & Integration
 
-| Component | Library | Usage |
-|-----------|---------|-------|
-| OSD | `pyannote.audio` | Detects overlapped speech regions |
-| Separation | `asteroid` | Conv-TasNet speaker separation |
-| Speaker Embedding | `sherpa-onnx` | ONNX-based speaker verification |
-| ASR | `sherpa-onnx` | SenseVoice/Paraformer transcription |
-| Audio I/O | `torchaudio` | Loading/saving WAV files |
-| Monitoring | `psutil` | CPU/GPU metrics (optional) |
+| Component         | Library          | Usage                               |
+| ----------------- | ---------------- | ----------------------------------- |
+| OSD               | `pyannote.audio` | Detects overlapped speech regions   |
+| Separation        | `asteroid`       | Conv-TasNet speaker separation      |
+| Speaker Embedding | `sherpa-onnx`    | ONNX-based speaker verification     |
+| ASR               | `sherpa-onnx`    | SenseVoice/Paraformer transcription |
+| Audio I/O         | `torchaudio`     | Loading/saving WAV files            |
+| Monitoring        | `psutil`         | CPU/GPU metrics (optional)          |
 
 ## Testing & Evaluation
 
