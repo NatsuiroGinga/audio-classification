@@ -2,13 +2,14 @@
 
 ## Project Overview
 
-This is an **audio classification & speech processing pipeline** project with three main branches:
+This is an **audio classification & speech processing pipeline** project with four main branches:
 
 1. **Speaker Identification**: VAD + Non-streaming ASR pipeline with speaker recognition
 2. **Overlapped Speech Handling (OSD)**: Detects overlapped speech, separates speakers, then runs ASR
 3. **3-Source Separation**: Libri3Mix experiments using OSD + 3-source separation + target speaker filtering
+4. **Streaming ASR**: Real-time speech recognition with Partial/Final results, VAD-based segmentation
 
-**Core Workflow**: Input mixed audio → OSD detection → source separation → speaker verification → ASR transcription
+**Core Workflow**: Input mixed audio → VAD/OSD detection → source separation → speaker verification → ASR transcription
 
 ## Architecture & Key Components
 
@@ -18,6 +19,7 @@ This is an **audio classification & speech processing pipeline** project with th
 - **`osd/osd.py`**: `OverlapAnalyzer` class wrapping pyannote.audio OSD pipeline (required dependency)
 - **`osd/separation.py`**: `Separator` class using Asteroid Conv-TasNet for 2/3-source speech separation
 - **`osd/dataset.py`**: Libri3Mix/LibriMix dataset handling
+- **`osd/streaming_asr.py`**: `StreamingASR` and `VADStreamingASR` classes for incremental ASR with Partial/Final results
 
 ### Pipeline Runners (`scripts/`)
 
@@ -25,7 +27,17 @@ This is an **audio classification & speech processing pipeline** project with th
 - **`osd/offline_overlap_3src.py`**: Offline 3-source OSD pipeline (file mode or LibriMix dataset mode)
 - **`osd/overlap3_core.py`**: **Core compute logic** (OSD → separation → target filtering → ASR), returns `PipelineResult` dataclass
 - **`osd/streaming_overlap3_core.py`**: Streaming variant with audio buffer and queue-based processing
+- **`osd/optimized_streaming_overlap3_core.py`**: Optimized streaming pipeline using direct separation (no OSD)
+- **`osd/vad_streaming_overlap3_core.py`**: VAD-based streaming pipeline with natural speech boundary detection
+- **`osd/streaming_asr_pipeline.py`**: **Streaming ASR Pipeline** with Partial/Final result support
+- **`osd/demo_streaming_asr.py`**: Demo script for streaming ASR visualization
 - **`osd/evaluate_with_sources.py`**: Libri2Mix evaluation with optional ASR comparison
+
+### Demo Scripts (`demo_video/`)
+
+- **`demo_single.py`**: Single-file processing demo
+- **`demo_streaming.py`**: Streaming processing demo with real-time output
+- **`demo_streaming.sh`**: Shell wrapper supporting fixed-interval and VAD modes
 
 ## Critical Patterns & Conventions
 
@@ -47,6 +59,12 @@ Three ASR backends via `create_asr_model()`:
 - Paraformer (single-model, fastest)
 - SenseVoice (multilingual via Sherpa-ONNX)
 - Transducer (Encoder-Decoder-Joiner, streaming-capable)
+
+**Streaming ASR** (`StreamingASRPipeline`):
+- Outputs **Partial results** during recognition (intermediate, may change)
+- Outputs **Final results** when VAD detects sentence end (stable)
+- Only VAD-based segmentation (no max duration forcing)
+- Optimized: Partial results use sliding window (3s) to avoid O(n²) complexity
 
 Use `--provider cuda|cpu|coreml` to control inference hardware.
 
@@ -102,6 +120,20 @@ python benchmark_pipeline.py \
   --tokens models/asr/tokens.txt
 ```
 
+### Running Streaming ASR Demo
+```bash
+cd scripts
+bash demo_streaming_asr.sh s1 0.3 0.5
+# Args: <sample> <chunk_duration> <partial_interval>
+```
+
+### Running VAD-based Streaming Demo
+```bash
+cd demo_video
+bash demo_streaming.sh s1 2.0 0.4 --vad
+# --vad enables VAD-based segmentation
+```
+
 ## External Dependencies & Integration
 
 | Component | Library | Usage |
@@ -122,7 +154,10 @@ python benchmark_pipeline.py \
 ## Key File References
 
 - Pipeline compute: [scripts/osd/overlap3_core.py](scripts/osd/overlap3_core.py)
+- Streaming ASR pipeline: [scripts/osd/streaming_asr_pipeline.py](scripts/osd/streaming_asr_pipeline.py)
+- VAD streaming pipeline: [scripts/osd/vad_streaming_overlap3_core.py](scripts/osd/vad_streaming_overlap3_core.py)
 - Benchmark runner: [scripts/benchmark_pipeline.py](scripts/benchmark_pipeline.py)
 - Model definitions: [src/model.py](src/model.py)
+- Streaming ASR module: [src/osd/streaming_asr.py](src/osd/streaming_asr.py)
 - OSD wrapper: [src/osd/osd.py](src/osd/osd.py)
 - Separation module: [src/osd/separation.py](src/osd/separation.py)

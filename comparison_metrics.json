@@ -1,0 +1,104 @@
+{
+  "samples": [
+    {
+      "id": "s1",
+      "reference": "王英汉被枪毙后，部分遗孽深藏起来，几次围捕均未抓获。",
+      "osd_stitching": 0.0,
+      "osd_audio_cat": 0.0,
+      "direct_separation": 0.5051
+    },
+    {
+      "id": "s2",
+      "reference": "第二，要把经济手段和恰当的行政手段结合起来加以运用，特别要注意运用好经济手段。",
+      "osd_stitching": 0.0,
+      "osd_audio_cat": 0.0,
+      "direct_separation": 0.7169
+    },
+    {
+      "id": "s3",
+      "reference": "散文是颇具魅力的一种文体，因其在语言文采与构思和意境上的讲求，散文又有美文之称。",
+      "osd_stitching": 0.0,
+      "osd_audio_cat": 0.0,
+      "direct_separation": 0.7276
+    },
+    {
+      "id": "s4",
+      "reference": "和雪一样，有无数无声的激情，与世界浑然一体，曾经历史养活，又孕育美丽的明天。",
+      "osd_stitching": 0.86,
+      "osd_audio_cat": 0.86,
+      "direct_separation": 0.8605
+    },
+    {
+      "id": "s5",
+      "reference": "他走到屋角脸盆架旁，把脸盆咣当一声扔在一摞脸盆上。",
+      "osd_stitching": 0.0,
+      "osd_audio_cat": 0.0,
+      "direct_separation": 0.5718
+    },
+    {
+      "id": "s6",
+      "reference": "此外，与汽车相关的非运输从业人员也达2万多人，年可增收5000万元以上。",
+      "osd_stitching": 0.0,
+      "osd_audio_cat": 0.0,
+      "direct_separation": 0.6103
+    },
+    {
+      "id": "s7",
+      "reference": "力生经营的体育用品包罗万象小到游泳耳塞、大致大型体育器械，可以说应有尽有。",
+      "osd_stitching": 0.0,
+      "osd_audio_cat": 0.0,
+      "direct_separation": 0.6946
+    },
+    {
+      "id": "s8",
+      "reference": "你要我有了爱情才结婚，可是我就没有啊，也找不到啊，叫我怎么办？",
+      "osd_stitching": 0.0,
+      "osd_audio_cat": 0.0,
+      "direct_separation": 0.6587
+    },
+    {
+      "id": "s9",
+      "reference": "越往森林里走，光色越来越暗，远远传来熊猫等人的相互呼唤，他也呵呵地大声作答。",
+      "osd_stitching": 0.0,
+      "osd_audio_cat": 0.0,
+      "direct_separation": 0.5014
+    },
+    {
+      "id": "s10",
+      "reference": "王一汉被枪毙后，部分鱼孽深藏起来，几次围捕，均未抓获。",
+      "osd_stitching": 0.0,
+      "osd_audio_cat": 0.0,
+      "direct_separation": 0.347
+    }
+  ],
+  "metrics": {
+    "samples_count": 10,
+    "osd_method": {
+      "mean_score": 0.086,
+      "median_score": 0.0,
+      "max_score": 0.86,
+      "min_score": 0.0,
+      "std_score": 0.258,
+      "zero_score_count": 9,
+      "nonzero_count": 1
+    },
+    "direct_method": {
+      "mean_score": 0.6194,
+      "median_score": 0.6345,
+      "max_score": 0.8605,
+      "min_score": 0.347,
+      "std_score": 0.1379,
+      "zero_score_count": 0,
+      "nonzero_count": 10
+    },
+    "comparison": {
+      "direct_wins": 10,
+      "osd_wins": 0,
+      "ties": 0,
+      "direct_better_rate": 1.0,
+      "average_improvement": 0.5334,
+      "max_improvement": 0.7276,
+      "min_improvement": 0.0005
+    }
+  }
+}

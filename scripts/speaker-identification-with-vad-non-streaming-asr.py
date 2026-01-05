@@ -58,9 +58,7 @@ python3 ./python-api-examples/speaker-identification-with-vad-non-streaming-asr.
   --model ./wespeaker_zh_cnceleb_resnet34.onnx
 """
 import argparse
-import csv
 import sys
-from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -69,11 +67,15 @@ import numpy as np
 import sherpa_onnx
 import soundfile as sf
 
-# sounddevice is optional for offline evaluation
-try:  # pragma: no cover - optional dependency
-    import sounddevice as sd  # type: ignore
-except Exception:  # pragma: no cover
-    sd = None  # type: ignore
+try:
+    import sounddevice as sd
+except ImportError:
+    print("Please install sounddevice first. You can use")
+    print()
+    print("  pip install sounddevice")
+    print()
+    print("to install it")
+    sys.exit(-1)
 
 g_sample_rate = 16000
 
@@ -199,13 +201,6 @@ def get_args():
     register_non_streaming_asr_model_args(parser)
 
     parser.add_argument(
-        "--language",
-        type=str,
-        default="auto",
-        help="Language code (e.g., 'en', 'zh'), default: auto",
-    )
-
-    parser.add_argument(
         "--speaker-file",
         type=str,
         required=True,
@@ -227,7 +222,7 @@ def get_args():
         help="Path to silero_vad.onnx",
     )
 
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--threshold", type=float, default=0.6)
 
     parser.add_argument(
         "--num-threads",
@@ -248,20 +243,6 @@ def get_args():
         type=str,
         default="cpu",
         help="Valid values: cpu, cuda, coreml",
-    )
-
-    parser.add_argument(
-        "--test-list",
-        type=str,
-        default="dataset/test-speaker.txt",
-        help="Path to test list (format: '<speaker> <wav_path>')",
-    )
-
-    parser.add_argument(
-        "--out-dir",
-        type=str,
-        default="test",
-        help="Directory to write predictions.csv and report.txt",
     )
 
     return parser.parse_args()
@@ -351,7 +332,6 @@ def create_recognizer(args) -> sherpa_onnx.OfflineRecognizer:
             num_threads=args.num_threads,
             use_itn=True,
             debug=args.debug,
-            language=args.language,
         )
     else:
         raise ValueError("Please specify at least one model")
@@ -400,14 +380,6 @@ def load_audio(filename: str) -> Tuple[np.ndarray, int]:
     )
     data = data[:, 0]  # use only the first channel
     samples = np.ascontiguousarray(data)
-    # Ensure 16k sample rate to match extractor expectation
-    if sample_rate != g_sample_rate and len(samples) > 1:
-        target_n = int(round(len(samples) * g_sample_rate / sample_rate))
-        if target_n > 1:
-            old_idx = np.arange(len(samples), dtype=np.float64)
-            new_idx = np.linspace(0, len(samples) - 1, target_n, dtype=np.float64)
-            samples = np.interp(new_idx, old_idx, samples).astype(np.float32)
-            sample_rate = g_sample_rate
     return samples, sample_rate
 
 
@@ -433,52 +405,7 @@ def compute_speaker_embedding(
         else:
             ans += embedding
 
-    return ans / len(filenames)  # type: ignore
-
-
-def write_eval_outputs(
-    *,
-    base_out_dir: Path,
-    rows: List[Tuple[str, str, str, str, float]],
-    train_speakers: int,
-    total: int,
-    correct: int,
-    unknown_cnt: int,
-    model: str,
-    test_list_path: str,
-    threshold: float,
-) -> Path:
-    """Write predictions.csv 和 report.txt 到按时间戳创建的子目录下。
-
-    返回创建的运行目录路径。
-    """
-    # e.g. 2025-09-09_14-03-27
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = base_out_dir / ts
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # predictions.csv
-    pred_csv = run_dir / "predictions.csv"
-    with pred_csv.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["wav", "speaker_true", "speaker_pred", "text", "score"])
-        for r in rows:
-            w.writerow(r)
-
-    # report.txt
-    acc = (correct / total) if total else 0.0
-    report_txt = run_dir / "report.txt"
-    with report_txt.open("w", encoding="utf-8") as f:
-        f.write("Speaker Identification Offline Evaluation\n")
-        f.write(f"Train speakers: {train_speakers}\n")
-        f.write(f"Test utterances: {total}\n")
-        f.write(f"Accuracy: {acc:.4f} ({correct}/{total})\n")
-        f.write(f"Unknown predicted: {unknown_cnt}\n")
-        f.write(f"Model: {model}\n")
-        f.write(f"Test list: {test_list_path}\n")
-        f.write(f"Threshold: {threshold}\n")
-
-    return run_dir
+    return ans / len(filenames)
 
 
 def main():
@@ -489,23 +416,14 @@ def main():
     speaker_file = load_speaker_file(args)
 
     manager = sherpa_onnx.SpeakerEmbeddingManager(extractor.dim)
-    enrolled: Dict[str, np.ndarray] = {}
     for name, filename_list in speaker_file.items():
         embedding = compute_speaker_embedding(
             filenames=filename_list,
             extractor=extractor,
         )
-        enrolled[name] = np.asarray(embedding, dtype=np.float32)
         status = manager.add(name, embedding)
         if not status:
             raise RuntimeError(f"Failed to register speaker {name}")
-
-    # Pre-normalize enrolled embeddings for cosine scoring
-    def _l2(x: np.ndarray) -> np.ndarray:
-        n = np.linalg.norm(x)
-        return x if n == 0 else x / n
-
-    enrolled_norm = {k: _l2(v) for k, v in enrolled.items()}
 
     vad_config = sherpa_onnx.VadModelConfig()
     vad_config.silero_vad.model = args.silero_vad_model
@@ -521,90 +439,57 @@ def main():
 
     samples_per_read = int(0.1 * g_sample_rate)  # 0.1 second = 100 ms
 
-    print("Started offline evaluation from local wavs")
+    devices = sd.query_devices()
+    if len(devices) == 0:
+        print("No microphone devices found")
+        sys.exit(0)
 
-    # Offline evaluation: read test list and compute accuracy using manager.search
-    test_list_path = Path(args.test_list)
-    assert test_list_path.is_file(), f"{test_list_path} not found"
-    print(f"Using test list: {test_list_path}")
+    print(devices)
+    default_input_device_idx = sd.default.device[0]
+    print(f'Use default device: {devices[default_input_device_idx]["name"]}')
 
-    test_map = defaultdict(list)
-    with open(test_list_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            fields = line.split()
-            if len(fields) != 2:
-                raise ValueError(f"Invalid line: {line}")
-            spk, wav = fields
-            test_map[spk].append(wav)
+    print("Started! Please speak")
 
-    total = 0
-    correct = 0
-    unknown_cnt = 0
-    rows: List[Tuple[str, str, str, str, float]] = (
-        []
-    )  # (wav, true, pred, text, top1_score)
+    idx = 0
+    buffer = []
+    with sd.InputStream(channels=1, dtype="float32", samplerate=g_sample_rate) as s:
+        while True:
+            samples, _ = s.read(samples_per_read)  # a blocking read
+            samples = samples.reshape(-1)
+            buffer = np.concatenate([buffer, samples])
+            while len(buffer) > window_size:
+                vad.accept_waveform(buffer[:window_size])
+                buffer = buffer[window_size:]
 
-    for spk_true, wavs in test_map.items():
-        for wav in wavs:
-            samples, sample_rate = load_audio(wav)
-            stream = extractor.create_stream()
-            stream.accept_waveform(sample_rate=sample_rate, waveform=samples)
-            stream.input_finished()
+            while not vad.empty():
+                if len(vad.front.samples) < 0.5 * g_sample_rate:
+                    # this segment is too short, skip it
+                    vad.pop()
+                    continue
+                stream = extractor.create_stream()
+                stream.accept_waveform(
+                    sample_rate=g_sample_rate, waveform=vad.front.samples
+                )
+                stream.input_finished()
 
-            assert extractor.is_ready(stream)
-            embedding = extractor.compute(stream)
-            embedding = np.array(embedding, dtype=np.float32)
-            emb_n = _l2(embedding)
+                embedding = extractor.compute(stream)
+                embedding = np.array(embedding)
+                name = manager.search(embedding, threshold=args.threshold)
+                if not name:
+                    name = "unknown"
 
-            pred = manager.search(embedding, threshold=args.threshold)
-            if not pred:
-                pred = "unknown"
+                # Now for non-streaming ASR
+                asr_stream = recognizer.create_stream()
+                asr_stream.accept_waveform(
+                    sample_rate=g_sample_rate, waveform=vad.front.samples
+                )
+                recognizer.decode_stream(asr_stream)
+                text = asr_stream.result.text
 
-            # Now for non-streaming ASR on the same wav
-            asr_stream = recognizer.create_stream()
-            asr_stream.accept_waveform(sample_rate=sample_rate, waveform=samples)
-            recognizer.decode_stream(asr_stream)
-            text = asr_stream.result.text
+                vad.pop()
 
-            # Compute top-1 cosine score against all enrolled (for diagnostics)
-            if enrolled_norm:
-                names = list(enrolled_norm.keys())
-                mat = np.stack([enrolled_norm[n] for n in names], axis=0)
-                scores = mat @ emb_n
-                top1_idx = int(np.argmax(scores))
-                top1_score = float(scores[top1_idx])
-            else:
-                top1_score = float("nan")
-
-            total += 1
-            if pred == spk_true:
-                correct += 1
-            elif pred == "unknown":
-                unknown_cnt += 1
-
-            print(
-                f"{total}: true={spk_true} pred={pred} text={text} file={Path(wav).name}"
-            )
-            rows.append((str(wav), spk_true, pred, text, top1_score))
-
-    acc = correct / total if total else 0.0
-    print(f"Eval done. Accuracy: {acc:.4f} ({correct}/{total}), unknown: {unknown_cnt}")
-
-    run_dir = write_eval_outputs(
-        base_out_dir=Path(args.out_dir),
-        rows=rows,
-        train_speakers=len(enrolled),
-        total=total,
-        correct=correct,
-        unknown_cnt=unknown_cnt,
-        model=args.model,
-        test_list_path=str(test_list_path),
-        threshold=args.threshold,
-    )
-    print(f"Outputs saved to: {run_dir}")
+                print(f"\r{idx}-{name}: {text}")
+                idx += 1
 
 
 if __name__ == "__main__":
