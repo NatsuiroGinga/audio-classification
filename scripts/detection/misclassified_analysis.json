@@ -1,0 +1,18 @@
+{
+  "positive": {
+    "total": 0,
+    "fp_decoy": 0,
+    "fp_decoy_rate": 0,
+    "by_decoy": {},
+    "samples": []
+  },
+  "homophone": {
+    "total": 0,
+    "leaked": 0,
+    "intercepted": 0,
+    "leak_rate": 0,
+    "intercept_rate": 0,
+    "leaked_samples": [],
+    "intercepted_samples": []
+  }
+}

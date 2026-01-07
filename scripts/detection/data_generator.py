@@ -96,12 +96,25 @@ NEGATIVE_PHRASES_NORMAL = [
     "你好真好",  # 相似但不同
 ]
 
-# 谐音负样本（专门测试抗干扰能力）
+# 谐音负样本（应阻断）
+# 注意：
+# - 一声同音字（珍/甄/臻）与目标词音频完全相同，KWS 无法区分，无需测试
+# - 同声调同韵母的字发音相同（如镇/阵/振/震都是zhèn），只保留一个代表词
 NEGATIVE_PHRASES_HOMOPHONE = [
-    "你好镇镇",  # 谐音
-    "泥豪真真",  # 谐音
-    "李浩真真",  # 谐音
-    "你好珍珍",  # 谐音
+    # 声调变体 - zhen 系列（每个声调保留一个代表）
+    "你好镇镇",  # zhèn (第四声) - 代表：镇/阵/振/震
+    "你好诊诊",  # zhěn (第三声) - 代表：诊/枕
+    # 声调变体 - zheng 系列
+    "你好正正",  # zhèng (第四声)
+    "你好争争",  # zhēng (第一声) - 代表：争/征
+    "你好整整",  # zhěng (第三声)
+    # 声母变体（r/c/z 与 zh 的区分）
+    "你好认认",  # rèn (r vs zh)
+    "你好曾曾",  # céng (c vs zh)
+    "你好怎怎",  # zěn (z vs zh)
+    # 声母变体（首字变化）
+    "李浩真真",  # lǐ háo (l vs n)
+    "泥豪真真",  # ní háo (n vs n)
 ]
 
 # 合并（兼容旧代码）
@@ -122,6 +135,7 @@ class GeneratorConfig:
     include_clean: bool = True  # 是否包含无噪声版本
     voices: List[str] = field(default_factory=list)  # 空表示使用所有语音
     seed: int = 42
+    homophone_only: bool = False  # 是否只生成谐音词
 
 
 # ============================================================================
@@ -488,13 +502,31 @@ class DataGenerator:
         """生成负样本（不含唤醒词）。"""
         print(f"\n生成负样本: {self.config.num_negative} 个")
 
+        # 如果是 homophone_only 模式，使用固定谐音词列表并均匀分布
+        if self.config.homophone_only:
+            negative_phrases = NEGATIVE_PHRASES_HOMOPHONE
+            print(f"谐音词模式：为 {len(negative_phrases)} 个谐音词各生成样本")
+            # 均匀分布：每个谐音词生成相同数量的样本
+            samples_per_phrase = self.config.num_negative // len(negative_phrases)
+            phrase_list = negative_phrases * samples_per_phrase
+            # 补齐不足的样本
+            remaining = self.config.num_negative - len(phrase_list)
+            phrase_list.extend(random.sample(negative_phrases, remaining))
+            random.shuffle(phrase_list)
+        else:
+            negative_phrases = NEGATIVE_PHRASES
+            phrase_list = None  # 随机模式
+
         samples_info: List[Dict[str, Any]] = []
         sample_idx = 0
 
         while sample_idx < self.config.num_negative:
             # 随机选择语音和短语
             voice = random.choice(self.voices)
-            phrase = random.choice(NEGATIVE_PHRASES)
+            if phrase_list is not None:
+                phrase = phrase_list[sample_idx]  # 均匀分布模式
+            else:
+                phrase = random.choice(negative_phrases)  # 随机模式
             rate = random.choice(RATE_VARIATIONS)
             pitch = random.choice(PITCH_VARIATIONS)
 
@@ -675,6 +707,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="列出可用语音",
     )
+    parser.add_argument(
+        "--homophone-only",
+        action="store_true",
+        help="只生成谐音词负样本（用于扩充测试数据）",
+    )
 
     return parser.parse_args()
 
@@ -694,18 +731,39 @@ def main() -> None:
     # 解析语音列表
     voices = [v.strip() for v in args.voices.split(",") if v.strip()]
 
-    config = GeneratorConfig(
-        keyword=args.keyword,
-        output_dir=args.output_dir,
-        num_positive=args.num_positive,
-        num_negative=args.num_negative,
-        noise_dir=args.noise_dir or None,
-        snr_range=snr_range,
-        sample_rate=args.sample_rate,
-        include_clean=not args.no_clean,
-        voices=voices,
-        seed=args.seed,
-    )
+    # 如果只生成谐音词，覆盖负样本短语列表
+    if args.homophone_only:
+        print(f"\n只生成谐音词测试数据（共 {len(NEGATIVE_PHRASES_HOMOPHONE)} 个短语）")
+        for i, phrase in enumerate(NEGATIVE_PHRASES_HOMOPHONE, 1):
+            print(f"  {i}. {phrase}")
+        # 使用固定的谐音词列表
+        config = GeneratorConfig(
+            keyword=args.keyword,
+            output_dir=args.output_dir,
+            num_positive=0,  # 不生成正样本
+            num_negative=len(NEGATIVE_PHRASES_HOMOPHONE)
+            * 12,  # 每个谐音词生成 12 个样本
+            noise_dir=args.noise_dir or None,
+            snr_range=snr_range,
+            sample_rate=args.sample_rate,
+            include_clean=not args.no_clean,
+            voices=voices,
+            seed=args.seed,
+            homophone_only=True,
+        )
+    else:
+        config = GeneratorConfig(
+            keyword=args.keyword,
+            output_dir=args.output_dir,
+            num_positive=args.num_positive,
+            num_negative=args.num_negative,
+            noise_dir=args.noise_dir or None,
+            snr_range=snr_range,
+            sample_rate=args.sample_rate,
+            include_clean=not args.no_clean,
+            voices=voices,
+            seed=args.seed,
+        )
 
     generator = DataGenerator(config)
     generator.generate()

@@ -1,0 +1,62 @@
+Traceback (most recent正样本: 144
+谐音负样本: 36
+真实负样本: 144
+
+开始差异化参数搜索 (threshold=0.4)，共 12 种配置...
+
+[1/12] target_boost=2.2, decoy_boost=1.5
+  FRR: 5.56%, Intercept: 69.7%, FA_true: 0
+
+[2/12] target_boost=2.2, decoy_boost=1.8
+  FRR: 5.56%, Intercept: 72.7%, FA_true: 0
+
+[3/12] target_boost=2.2, decoy_boost=2.0
+  FRR: 6.25%, Intercept: 72.7%, FA_true: 0
+
+[4/12] target_boost=2.5, decoy_boost=1.5
+  FRR: 8.33%, Intercept: 66.7%, FA_true: 0
+
+[5/12] target_boost=2.5, decoy_boost=1.8
+  FRR: 8.33%, Intercept: 67.6%, FA_true: 0
+
+[6/12] target_boost=2.5, decoy_boost=2.0
+  FRR: 9.03%, Intercept: 70.6%, FA_true: 0
+
+[7/12] target_boost=2.8, decoy_boost=1.5
+  FRR: 10.42%, Intercept: 71.0%, FA_true: 0
+
+[8/12] target_boost=2.8, decoy_boost=1.8
+  FRR: 10.42%, Intercept: 71.0%, FA_true: 0
+
+[9/12] target_boost=2.8, decoy_boost=2.0
+  FRR: 11.11%, Intercept: 71.0%, FA_true: 0
+
+[10/12] target_boost=3.0, decoy_boost=1.5
+  FRR: 11.11%, Intercept: 70.0%, FA_true: 0
+
+[11/12] target_boost=3.0, decoy_boost=1.8
+  FRR: 11.11%, Intercept: 70.0%, FA_true: 0
+
+[12/12] target_boost=3.0, decoy_boost=2.0
+  FRR: 11.11%, Intercept: 70.0%, FA_true: 0
+
+结果已保存到: differential_results.json
+
+⚠️  未找到完全满足目标的配置
+最接近的 Top 5：
+
+1. target_boost=2.2, decoy_boost=1.8
+   FRR: 5.56%, Intercept: 72.7%, FA_true: 0
+
+2. target_boost=2.2, decoy_boost=1.5
+   FRR: 5.56%, Intercept: 69.7%, FA_true: 0
+
+3. target_boost=2.2, decoy_boost=2.0
+   FRR: 6.25%, Intercept: 72.7%, FA_true: 0
+
+4. target_boost=2.5, decoy_boost=1.8
+   FRR: 8.33%, Intercept: 67.6%, FA_true: 0
+
+5. target_boost=2.5, decoy_boost=1.5
+   FRR: 8.33%, Intercept: 66.7%, FA_true: 0
+

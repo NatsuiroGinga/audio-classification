@@ -1,0 +1,112 @@
+[
+  {
+    "threshold": 0.15,
+    "tp": 121,
+    "fp": 18,
+    "fn": 5,
+    "fa_decoy_intercepted": 24,
+    "fa_decoy_leak": 10,
+    "fa_true": 0,
+    "frr": 3.4722222222222223,
+    "intercept_rate": 70.58823529411765
+  },
+  {
+    "threshold": 0.2,
+    "tp": 121,
+    "fp": 18,
+    "fn": 5,
+    "fa_decoy_intercepted": 24,
+    "fa_decoy_leak": 10,
+    "fa_true": 0,
+    "frr": 3.4722222222222223,
+    "intercept_rate": 70.58823529411765
+  },
+  {
+    "threshold": 0.25,
+    "tp": 121,
+    "fp": 18,
+    "fn": 5,
+    "fa_decoy_intercepted": 24,
+    "fa_decoy_leak": 10,
+    "fa_true": 0,
+    "frr": 3.4722222222222223,
+    "intercept_rate": 70.58823529411765
+  },
+  {
+    "threshold": 0.3,
+    "tp": 121,
+    "fp": 18,
+    "fn": 5,
+    "fa_decoy_intercepted": 24,
+    "fa_decoy_leak": 10,
+    "fa_true": 0,
+    "frr": 3.4722222222222223,
+    "intercept_rate": 70.58823529411765
+  },
+  {
+    "threshold": 0.35,
+    "tp": 121,
+    "fp": 18,
+    "fn": 5,
+    "fa_decoy_intercepted": 24,
+    "fa_decoy_leak": 10,
+    "fa_true": 0,
+    "frr": 3.4722222222222223,
+    "intercept_rate": 70.58823529411765
+  },
+  {
+    "threshold": 0.4,
+    "tp": 121,
+    "fp": 18,
+    "fn": 5,
+    "fa_decoy_intercepted": 24,
+    "fa_decoy_leak": 10,
+    "fa_true": 0,
+    "frr": 3.4722222222222223,
+    "intercept_rate": 70.58823529411765
+  },
+  {
+    "threshold": 0.45,
+    "tp": 121,
+    "fp": 18,
+    "fn": 5,
+    "fa_decoy_intercepted": 24,
+    "fa_decoy_leak": 10,
+    "fa_true": 0,
+    "frr": 3.4722222222222223,
+    "intercept_rate": 70.58823529411765
+  },
+  {
+    "threshold": 0.5,
+    "tp": 121,
+    "fp": 18,
+    "fn": 5,
+    "fa_decoy_intercepted": 24,
+    "fa_decoy_leak": 10,
+    "fa_true": 0,
+    "frr": 3.4722222222222223,
+    "intercept_rate": 70.58823529411765
+  },
+  {
+    "threshold": 0.55,
+    "tp": 121,
+    "fp": 18,
+    "fn": 5,
+    "fa_decoy_intercepted": 24,
+    "fa_decoy_leak": 10,
+    "fa_true": 0,
+    "frr": 3.4722222222222223,
+    "intercept_rate": 70.58823529411765
+  },
+  {
+    "threshold": 0.6,
+    "tp": 121,
+    "fp": 18,
+    "fn": 5,
+    "fa_decoy_intercepted": 24,
+    "fa_decoy_leak": 10,
+    "fa_true": 0,
+    "frr": 3.4722222222222223,
+    "intercept_rate": 70.58823529411765
+  }
+]
