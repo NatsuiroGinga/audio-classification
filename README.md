@@ -2,9 +2,10 @@
 
 本项目包含：
 
-1. 基于 VAD + 非流式 ASR 的说话人识别主流程（含 Benchmark）。
-2. “重叠说话”离线 MVP：当前版本已精简为 **OSD（重叠检测）+ 语音分离 + ASR（无说话人识别 / 无 CER）**，面向 **Libri2Mix 8k test** 混合语音集的快速实验。
-3. 三说话人（3-src）语音分离快速实验仓库：基于 OSD + 三路分离 + 目标说话人筛选 + ASR 的离线管线，面向 Libri3Mix / 自建三说话人混合的快速实验。
+1. **基于 VAD + 非流式 ASR 的说话人识别主流程**（含 Benchmark）。
+2. **"重叠说话"离线 MVP**：当前版本已精简为 **OSD（重叠检测）+ 语音分离 + ASR（无说话人识别 / 无 CER）**，面向 **Libri2Mix 8k test** 混合语音集的快速实验。
+3. **三说话人（3-src）语音分离快速实验仓库**：基于 OSD + 三路分离 + 目标说话人筛选 + ASR 的离线管线，面向 Libri3Mix / 自建三说话人混合的快速实验。
+4. **关键词唤醒（KWS）模块**（已优化）：基于 sherpa-onnx Zipformer 的低延迟唤醒词检测，包含谐音词拦截机制，性能指标：FRR=1.39%，FAR=7.46%，RTF=0.017。
 
 ## 依赖安装与快速运行
 
@@ -129,3 +130,102 @@ python3 batch_eval.py \
 - THCHS30（清华大学中文语音数据集）：http://www.openslr.org/resources/18/data_thchs30.tgz，可用于中文 ASR 训练或快速中文 domain 适配测试。
 
 更多细节与高级用法请查看 `scripts/osd` 下的各脚本（`test_overlap_3src.sh`, `offline_overlap_3src.py`, `overlap3_core.py`）
+
+---
+
+## 关键词唤醒（KWS）模块
+
+本项目包含一个经过优化的关键词唤醒模块，适用于低延迟唤醒词检测场景。
+
+### 模块概览
+
+- **模型**：Sherpa-ONNX Zipformer Transducer（3.3M 参数，INT8 量化）
+- **唤醒词**：支持自定义，默认为"你好真真"
+- **谐音词拦截**：包含 6 个谐音词拦截机制，防止误触发
+- **性能指标**：
+  - FRR (漏报率)：**1.39%** ✅
+  - FAR (误报率)：**7.46%** (排除模型无法区分的"你好"变体后)
+  - RTF (实时因子)：**0.0171** ✅
+
+### 快速开始
+
+#### 快速测试单个音频
+
+```bash
+cd scripts/detection/core
+python test_nihao_zhenzhen.py --wav /path/to/audio.wav
+```
+
+#### 完整性能评估
+
+```bash
+cd scripts/detection/core
+python benchmark_kws.py \
+  --model-dir ../../models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01 \
+  --positive-dir ../../dataset/kws_test_data_merged/positive \
+  --negative-dir ../../dataset/kws_test_data_merged/negative \
+  --keywords-file ../../test/detection/decoy_keywords.txt
+```
+
+#### 交互式演示
+
+```bash
+cd scripts/detection/core
+python demo_wakeword.py /path/to/audio.wav --config balanced
+```
+
+#### 生成测试数据
+
+```bash
+cd scripts/detection/utils
+python data_generator.py \
+  --keyword "你好真真" \
+  --num-positive 144 \
+  --num-negative 540 \
+  --output-dir ../../dataset/my_test_data
+```
+
+### 目录结构
+
+```
+scripts/detection/
+├── core/                          # 核心功能脚本
+│   ├── benchmark_kws.py          # 主评估脚本
+│   ├── test_nihao_zhenzhen.py    # 快速测试
+│   └── demo_wakeword.py          # 交互式演示
+├── utils/                         # 工具脚本
+│   ├── data_generator.py         # 数据生成
+│   ├── merge_test_data.py        # 数据合并
+│   ├── generate_keywords.py      # 关键词转换
+│   └── generate_keywords_zh_en.py # 中英文关键词转换
+├── kws_config.py                 # 统一配置
+└── README.md                      # 详细使用指南
+```
+
+### 配置说明
+
+所有 KWS 参数统一管理在 `scripts/detection/kws_config.py` 中：
+
+- **目标关键词**：boost=2.0, threshold=0.20
+- **Decoy 关键词**（6 个）：boost=1.0, threshold=0.20
+  - 声调变体：你好镇镇(4 声)、正正(4 声)、争争(1 声)
+  - 声母变体：你好认认、曾曾、怎怎
+- **排除项**：
+  - 三声变体 (诊诊/整整)：与陕西方言 TTS 冲突，已移除
+  - "你好"变体 (泥豪/李浩)：模型声学上无法区分，已排除
+
+### 测试数据
+
+- **正样本**：144 个（8 种 TTS 声音，6 个 SNR 水平）
+- **负样本**：456 个（6 个谐音词 + 其他真实否定样本，排除 84 个不可区分样本）
+- **覆盖**：标准普通话、陕西方言等多方言 TTS
+
+### 文档与参考
+
+- `scripts/detection/README.md` - 详细使用指南
+- `scripts/detection/CHANGES.md` - 代码变更清单
+- `KWS_OPTIMIZATION_SUMMARY.md` - 优化总结报告
+- `src/detection/model.py` - KWS 模型包装器
+- `src/detection/decoy_filter.py` - 谐音词过滤器
+
+---
