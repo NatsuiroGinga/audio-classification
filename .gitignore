@@ -17,4 +17,5 @@ todo*
 test*/
 other/
 scripts/stream/
-demo*
+demo_video/
+demo_video/core.*
