@@ -18,3 +18,9 @@ test*/
 other/
 scripts/stream/
 demo*
+
+# Core dumps and crash files
+core.*
+*.crash
+*.dmp
+*.dump
