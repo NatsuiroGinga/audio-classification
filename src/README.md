@@ -23,6 +23,7 @@ src/
 **主要类：**
 
 #### `ASRModel`
+
 自动选择 ASR 后端的工厂类。
 
 ```python
@@ -42,11 +43,13 @@ print(result)  # {'text': '转录文本', 'confidence': 0.95}
 ```
 
 **支持的 ASR 后端：**
+
 - **Paraformer**：单一模型，推理速度快，适合实时场景
 - **SenseVoice**：多语言支持，通过 Sherpa-ONNX 运行
 - **Transducer**：Encoder-Decoder-Joiner 框架，支持流式识别
 
 #### `SpeakerEmbeddingManager`
+
 说话人嵌入提取与验证。
 
 ```python
@@ -73,6 +76,7 @@ print(is_match)  # True/False
 ### osd/ - 重叠检测与分离模块
 
 #### osd.py - OverlapAnalyzer
+
 使用 pyannote.audio 进行重叠检测。
 
 ```python
@@ -93,6 +97,7 @@ for start, end in overlaps:
 ```
 
 #### separation.py - Separator
+
 语音分离模块，支持 Conv-TasNet。
 
 ```python
@@ -121,6 +126,7 @@ print(f"SI-SDR: {si_sdr:.2f} dB")
 ```
 
 #### dataset.py - Libri3Mix 数据集处理
+
 处理 Libri3Mix/LibriMix 数据集。
 
 ```python
@@ -137,11 +143,12 @@ for sample in dataset:
     mixture = sample['mixture']      # 混合音频
     sources = sample['sources']      # [src1, src2, src3]
     speakers = sample['speakers']    # 说话人ID列表
-    
+
     print(f"混合时长: {mixture.shape[0]/16000:.2f}s")
 ```
 
 #### streaming_asr.py - StreamingASR
+
 流式 ASR 实现，支持中间结果和最终结果。
 
 ```python
@@ -163,12 +170,12 @@ waveform, sr = torchaudio.load('audio.wav')
 # 处理流
 for i in range(0, waveform.shape[1], 320):
     chunk = waveform[:, i:i+640]
-    
+
     # 获取中间结果（Partial）
     partial_result = asr.process_chunk(chunk, is_final=False)
     if partial_result:
         print(f"中间: {partial_result['text']}")
-    
+
     # 语音结束时获取最终结果
     if i == waveform.shape[1] - 1:
         final_result = asr.process_chunk(chunk, is_final=True)
@@ -189,6 +196,7 @@ for result in results:
 ```
 
 ### detection/ - 检测模块
+
 其他检测功能的实现（如关键词检测、说话人检测等）。
 
 ## 📊 数据流与集成
@@ -214,6 +222,7 @@ for result in results:
 ### 关键参数配置
 
 **ASR 模型：**
+
 ```python
 # 支持模型列表
 {
@@ -224,6 +233,7 @@ for result in results:
 ```
 
 **推理后端：**
+
 ```python
 provider_options = {
     'cuda': ['CUDAExecutionProvider', 'CPUExecutionProvider'],
@@ -233,6 +243,7 @@ provider_options = {
 ```
 
 **说话人验证阈值：**
+
 ```python
 sv_threshold = 0.6  # 余弦相似度，推荐 0.5~0.7
 ```
@@ -267,12 +278,12 @@ for start, end in overlaps:
     start_idx = int(start * sr)
     end_idx = int(end * sr)
     overlap_seg = mixture[:, start_idx:end_idx]
-    
+
     separated = separator.separate(overlap_seg)
-    
+
     # 目标筛选
     target_embed = spk_manager.extract_embedding(target_audio)
-    
+
     best_src = None
     best_score = 0
     for i, src in enumerate(separated):
@@ -281,7 +292,7 @@ for start, end in overlaps:
         if score > best_score:
             best_score = score
             best_src = i
-    
+
     # ASR
     if best_src is not None and best_score > 0.6:
         result = asr.recognize(separated[best_src])
@@ -313,10 +324,12 @@ osd/
 ## ⚙️ 性能提示
 
 1. **模型加载优化**
+
    - 预加载模型并重用，避免重复加载
    - 使用 GPU 推理加速（provider='cuda'）
 
 2. **批处理**
+
    - 流式 ASR 支持批处理多个音频块
    - 分离模块可批处理多个混合
 

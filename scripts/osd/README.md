@@ -36,25 +36,25 @@ python offline_overlap_3src.py \
 
 **关键参数**：
 
-| 参数 | 说明 | 默认值 |
-|-----|------|--------|
-| `--input-wavs` | 输入混合音频（文件模式）| None |
-| `--target-wav` | 目标说话人音频 | None |
-| `--librimix-root` | Libri3Mix 根路径（数据集模式）| None |
-| `--subset` | 数据集子集 (train/test/dev) | test |
-| `--num-sources` | 源数 | 3 |
-| `--sep-backend` | 分离后端 (asteroid/custom) | asteroid |
-| `--sep-checkpoint` | 自定义分离模型 | None |
-| `--osd-backend` | OSD 后端 (pyannote) | pyannote |
-| `--spk-embed-model` | 说话人嵌入模型 | ✓ 必需 |
-| `--sense-voice` | ASR 模型 | ✓ 必需 |
-| `--tokens` | ASR 令牌表 | ✓ 必需 |
-| `--sv-threshold` | 说话人验证阈值 | 0.6 |
-| `--min-overlap-dur` | 最小重叠时长 (秒) | 0.2 |
-| `--eval-separation` | 计算 SI-SDR | False |
-| `--provider` | 推理后端 | cuda |
-| `--output-dir` | 输出目录 | test/overlap3 |
-| `--max-files` | 最多处理文件数 | -1 (全部) |
+| 参数                | 说明                           | 默认值        |
+| ------------------- | ------------------------------ | ------------- |
+| `--input-wavs`      | 输入混合音频（文件模式）       | None          |
+| `--target-wav`      | 目标说话人音频                 | None          |
+| `--librimix-root`   | Libri3Mix 根路径（数据集模式） | None          |
+| `--subset`          | 数据集子集 (train/test/dev)    | test          |
+| `--num-sources`     | 源数                           | 3             |
+| `--sep-backend`     | 分离后端 (asteroid/custom)     | asteroid      |
+| `--sep-checkpoint`  | 自定义分离模型                 | None          |
+| `--osd-backend`     | OSD 后端 (pyannote)            | pyannote      |
+| `--spk-embed-model` | 说话人嵌入模型                 | ✓ 必需        |
+| `--sense-voice`     | ASR 模型                       | ✓ 必需        |
+| `--tokens`          | ASR 令牌表                     | ✓ 必需        |
+| `--sv-threshold`    | 说话人验证阈值                 | 0.6           |
+| `--min-overlap-dur` | 最小重叠时长 (秒)              | 0.2           |
+| `--eval-separation` | 计算 SI-SDR                    | False         |
+| `--provider`        | 推理后端                       | cuda          |
+| `--output-dir`      | 输出目录                       | test/overlap3 |
+| `--max-files`       | 最多处理文件数                 | -1 (全部)     |
 
 **输出文件**：
 
@@ -99,6 +99,7 @@ print(result.compute_time)    # 计算耗时
 ```
 
 **数据流**：
+
 ```
 混合音频 → OSD检测 → 提取重叠区间 → 分离 → 说话人验证 → ASR → 结果
 ```
@@ -118,6 +119,7 @@ python streaming_overlap_3src.py \
 ```
 
 **流式处理特点**：
+
 - 块处理（chunk-based）：避免一次性加载整个音频
 - 缓冲区管理：维持滑动窗口
 - Partial/Final 结果：中间和最终输出
@@ -136,6 +138,7 @@ python streaming_asr_pipeline.py \
 ```
 
 **输出示例**：
+
 ```
 [Partial] 0.32s: 你好
 [Partial] 0.64s: 你好世界
@@ -147,6 +150,7 @@ python streaming_asr_pipeline.py \
 **功能**：使用 VAD 进行自然分段的流式处理。
 
 优势：
+
 - 自动检测说话边界
 - 无需手动设置分段时长
 - 更符合自然语音节奏
@@ -160,6 +164,7 @@ python -c "from scripts.osd.vad_streaming_overlap3_core import VADStreamingOverl
 **功能**：直接分离（跳过 OSD），加速流式处理。
 
 适用场景：
+
 - 高实时性要求
 - 已知音频中大部分是重叠部分
 
@@ -167,20 +172,20 @@ python -c "from scripts.osd.vad_streaming_overlap3_core import VADStreamingOverl
 
 ### 离线 vs 流式
 
-| 特点 | 离线 | 流式 |
-|------|------|------|
-| 延迟 | 高（需等待全部音频） | 低（边处理边输出） |
-| 内存 | 需加载全部音频 | 块处理，内存小 |
+| 特点 | 离线                   | 流式               |
+| ---- | ---------------------- | ------------------ |
+| 延迟 | 高（需等待全部音频）   | 低（边处理边输出） |
+| 内存 | 需加载全部音频         | 块处理，内存小     |
 | 精度 | 可能更高（上下文充足） | 略低（上下文限制） |
-| 应用 | 批量处理、评估 | 实时应用 |
+| 应用 | 批量处理、评估         | 实时应用           |
 
 ### OSD vs 直接分离
 
-| 方法 | OSD 分离 | 直接分离 |
-|-----|---------|---------|
-| 精度 | 更高（只分离重叠部分）| 全局分离 |
-| 速度 | 慢（多一步 OSD）| 快（直接分离） |
-| 适用 | 重叠片段较少 | 全是重叠 |
+| 方法 | OSD 分离               | 直接分离       |
+| ---- | ---------------------- | -------------- |
+| 精度 | 更高（只分离重叠部分） | 全局分离       |
+| 速度 | 慢（多一步 OSD）       | 快（直接分离） |
+| 适用 | 重叠片段较少           | 全是重叠       |
 
 ## 📊 评估指标
 
@@ -290,18 +295,22 @@ python streaming_overlap_3src.py
 ## 🐛 常见问题
 
 **Q: OSD 检测不准确**
+
 - A: 调整最小重叠时长 `--min-overlap-dur`
 - A: 检查音频质量和增益
 
 **Q: 分离效果差**
+
 - A: 使用自定义分离模型 `--sep-checkpoint`
-- A: 检查音频SNR（信噪比）
+- A: 检查音频 SNR（信噪比）
 
 **Q: 说话人验证失败**
+
 - A: 调整阈值 `--sv-threshold` (0.5~0.7)
 - A: 检查目标说话人音频质量
 
 **Q: 处理速度慢**
+
 - A: 使用 GPU (`--provider cuda`)
 - A: 使用优化版本 (`optimized_streaming_overlap3_core.py`)
 - A: 减小音频采样率
@@ -310,13 +319,13 @@ python streaming_overlap_3src.py
 
 基于 V100 GPU，16k 采样率，单说话人目标：
 
-| 阶段 | 耗时 | 占比 |
-|-----|------|------|
-| OSD | 12% | 少量音频检查 |
-| 分离 | 60% | 主要计算量 |
-| ASR | 25% | 转录 |
-| 说话人验证 | 3% | 嵌入提取 |
-| **总计** | **100%** | **RTF ≈ 0.5** |
+| 阶段       | 耗时     | 占比          |
+| ---------- | -------- | ------------- |
+| OSD        | 12%      | 少量音频检查  |
+| 分离       | 60%      | 主要计算量    |
+| ASR        | 25%      | 转录          |
+| 说话人验证 | 3%       | 嵌入提取      |
+| **总计**   | **100%** | **RTF ≈ 0.5** |
 
 ## 🔗 相关模块
 
